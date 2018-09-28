@@ -32,6 +32,8 @@ import org.apache.carbondata.core.util.CarbonProperties;
 
 import static org.apache.carbondata.core.constants.CarbonCommonConstants.CARBON_SEARCH_MODE_SCAN_THREAD;
 
+import org.apache.hadoop.conf.Configuration;
+
 /**
  * Below class will be used to execute the detail query and returns columnar vectors.
  */
@@ -40,8 +42,11 @@ public class SearchModeVectorDetailQueryExecutor extends AbstractQueryExecutor<O
           LogServiceFactory.getLogService(SearchModeVectorDetailQueryExecutor.class.getName());
   private static ExecutorService executorService = null;
 
-  static {
-    initThreadPool();
+  public SearchModeVectorDetailQueryExecutor(Configuration configuration) {
+    super(configuration);
+    if (executorService == null) {
+      initThreadPool();
+    }
   }
 
   private static synchronized void initThreadPool() {
@@ -74,9 +79,7 @@ public class SearchModeVectorDetailQueryExecutor extends AbstractQueryExecutor<O
   public CarbonIterator<Object> execute(QueryModel queryModel)
       throws QueryExecutionException, IOException {
     List<BlockExecutionInfo> blockExecutionInfoList = getBlockExecutionInfos(queryModel);
-    if (executorService == null) {
-      initThreadPool();
-    }
+
     this.queryIterator = new SearchModeVectorResultIterator(
         blockExecutionInfoList,
         queryModel,

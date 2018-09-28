@@ -48,7 +48,7 @@ import org.apache.carbondata.core.util.CarbonUtil;
  * for this Range. Also search the data block and set the required bitsets which falls within
  * the Range of the RANGE Expression.
  */
-public class RangeValueFilterExecuterImpl extends ValueBasedFilterExecuterImpl {
+public class RangeValueFilterExecuterImpl implements FilterExecuter {
 
   private DimColumnResolvedFilterInfo dimColEvaluatorInfo;
   private Expression exp;
@@ -72,6 +72,7 @@ public class RangeValueFilterExecuterImpl extends ValueBasedFilterExecuterImpl {
   private boolean startBlockMinIsDefaultStart;
   private boolean endBlockMaxisDefaultEnd;
   private boolean isRangeFullyCoverBlock;
+  private boolean isNaturalSorted;
 
   public RangeValueFilterExecuterImpl(DimColumnResolvedFilterInfo dimColEvaluatorInfo,
       Expression exp, byte[][] filterRangeValues, SegmentProperties segmentProperties) {
@@ -89,7 +90,10 @@ public class RangeValueFilterExecuterImpl extends ValueBasedFilterExecuterImpl {
     isRangeFullyCoverBlock = false;
     initDimensionChunkIndexes();
     ifDefaultValueMatchesFilter();
-
+    if (isDimensionPresentInCurrentBlock) {
+      isNaturalSorted = dimColEvaluatorInfo.getDimension().isUseInvertedIndex()
+          && dimColEvaluatorInfo.getDimension().isSortColumn();
+    }
   }
 
   /**
@@ -113,17 +117,17 @@ public class RangeValueFilterExecuterImpl extends ValueBasedFilterExecuterImpl {
    */
   private void ifDefaultValueMatchesFilter() {
     isDefaultValuePresentInFilter = false;
-    if (!this.isDimensionPresentInCurrentBlock) {
+    if (!this.isDimensionPresentInCurrentBlock && null != filterRangesValues) {
       CarbonDimension dimension = this.dimColEvaluatorInfo.getDimension();
       byte[] defaultValue = dimension.getDefaultValue();
       if (null != defaultValue) {
-        int maxCompare =
-            ByteUtil.UnsafeComparer.INSTANCE.compareTo(defaultValue, filterRangesValues[0]);
         int minCompare =
-            ByteUtil.UnsafeComparer.INSTANCE.compareTo(filterRangesValues[1], defaultValue);
+            FilterUtil.compareValues(filterRangesValues[0], defaultValue, dimension, true);
+        int maxCompare =
+            FilterUtil.compareValues(filterRangesValues[1], defaultValue, dimension, false);
 
-        if (((greaterThanExp && maxCompare > 0) || (greaterThanEqualExp && maxCompare >= 0))
-            && ((lessThanExp && minCompare > 0) || (lessThanEqualExp && minCompare >= 0))) {
+        if (((greaterThanExp && maxCompare > 0) || (greaterThanEqualExp && maxCompare >= 0)) && (
+            (lessThanExp && minCompare > 0) || (lessThanEqualExp && minCompare >= 0))) {
           isDefaultValuePresentInFilter = true;
         }
       }
@@ -139,7 +143,7 @@ public class RangeValueFilterExecuterImpl extends ValueBasedFilterExecuterImpl {
    */
   public BitSetGroup applyFilter(RawBlockletColumnChunks rawBlockletColumnChunks,
       boolean useBitsetPipeLine) throws FilterUnsupportedException, IOException {
-    return applyNoAndDirectFilter(rawBlockletColumnChunks);
+    return applyNoAndDirectFilter(rawBlockletColumnChunks, useBitsetPipeLine);
   }
 
   /**
@@ -232,7 +236,12 @@ public class RangeValueFilterExecuterImpl extends ValueBasedFilterExecuterImpl {
    * @param filterValues
    * @return
    */
-  public boolean isScanRequired(byte[] blockMinValue, byte[] blockMaxValue, byte[][] filterValues) {
+  public boolean isScanRequired(byte[] blockMinValue, byte[] blockMaxValue, byte[][] filterValues,
+      boolean isMinMaxSet) {
+    if (!isMinMaxSet) {
+      // scan complete data if min max is not written for a given column
+      return true;
+    }
     boolean isScanRequired = true;
     isRangeFullyCoverBlock = false;
     startBlockMinIsDefaultStart = false;
@@ -266,30 +275,35 @@ public class RangeValueFilterExecuterImpl extends ValueBasedFilterExecuterImpl {
     // Case D: Filter Values Completely overlaps Block Min and Max then all bits are set.
     //                       Block Min <-----------------------> Block Max
     //         Filter Min <-----------------------------------------------> Filter Max
+    // for no dictionary measure column comparison can be done
+    // on the original data as like measure column
 
     if (isDimensionPresentInCurrentBlock) {
+      CarbonDimension carbonDimension = dimColEvaluatorInfo.getDimension();
       if (((lessThanExp) && (
-          ByteUtil.UnsafeComparer.INSTANCE.compareTo(blockMinValue, filterValues[1]) >= 0)) || (
-          (lessThanEqualExp) && (
-              ByteUtil.UnsafeComparer.INSTANCE.compareTo(blockMinValue, filterValues[1]) > 0)) || (
+          FilterUtil.compareValues(filterValues[1], blockMinValue, carbonDimension, true) >= 0))
+          || ((lessThanEqualExp) && (
+          FilterUtil.compareValues(filterValues[1], blockMinValue, carbonDimension, true) > 0)) || (
           (greaterThanExp) && (
-              ByteUtil.UnsafeComparer.INSTANCE.compareTo(filterValues[0], blockMaxValue) >= 0)) || (
-          (greaterThanEqualExp) && (
-              ByteUtil.UnsafeComparer.INSTANCE.compareTo(filterValues[0], blockMaxValue) > 0))) {
+              FilterUtil.compareValues(filterValues[0], blockMaxValue, carbonDimension, false)
+                  >= 0)) || ((greaterThanEqualExp) && (
+          FilterUtil.compareValues(filterValues[0], blockMaxValue, carbonDimension, false) > 0))) {
         // completely out of block boundary
         isScanRequired = false;
       } else {
         if (((greaterThanExp) && (
-            ByteUtil.UnsafeComparer.INSTANCE.compareTo(blockMinValue, filterValues[0]) > 0)) || (
-            (greaterThanEqualExp) && (
-                ByteUtil.UnsafeComparer.INSTANCE.compareTo(blockMinValue, filterValues[0]) >= 0))) {
+            FilterUtil.compareValues(filterValues[0], blockMinValue, carbonDimension, true) > 0))
+            || ((greaterThanEqualExp) && (
+            FilterUtil.compareValues(filterValues[0], blockMinValue, carbonDimension, true)
+                >= 0))) {
           startBlockMinIsDefaultStart = true;
         }
 
         if (((lessThanExp) && (
-            ByteUtil.UnsafeComparer.INSTANCE.compareTo(filterValues[1], blockMaxValue) > 0)) || (
-            (lessThanEqualExp) && (
-                ByteUtil.UnsafeComparer.INSTANCE.compareTo(filterValues[1], blockMaxValue) >= 0))) {
+            FilterUtil.compareValues(filterValues[1], blockMaxValue, carbonDimension, false) > 0))
+            || ((lessThanEqualExp) && (
+            FilterUtil.compareValues(filterValues[1], blockMaxValue, carbonDimension, false)
+                >= 0))) {
           endBlockMaxisDefaultEnd = true;
         }
 
@@ -310,12 +324,14 @@ public class RangeValueFilterExecuterImpl extends ValueBasedFilterExecuterImpl {
    * @return
    */
   @Override
-  public BitSet isScanRequired(byte[][] blockMaxValue, byte[][] blockMinValue) {
+  public BitSet isScanRequired(byte[][] blockMaxValue, byte[][] blockMinValue,
+      boolean[] isMinMaxSet) {
     BitSet bitSet = new BitSet(1);
     byte[][] filterValues = this.filterRangesValues;
-    int columnIndex = this.dimColEvaluatorInfo.getColumnIndex();
-    boolean isScanRequired = columnIndex >= blockMinValue.length ||
-        isScanRequired(blockMinValue[columnIndex], blockMaxValue[columnIndex], filterValues);
+    int columnIndex = this.dimColEvaluatorInfo.getColumnIndexInMinMaxByteArray();
+    boolean isScanRequired =
+        columnIndex >= blockMinValue.length || isScanRequired(blockMinValue[columnIndex],
+            blockMaxValue[columnIndex], filterValues, isMinMaxSet[columnIndex]);
     if (isScanRequired) {
       bitSet.set(0);
     }
@@ -328,8 +344,8 @@ public class RangeValueFilterExecuterImpl extends ValueBasedFilterExecuterImpl {
    * @return
    * @throws IOException
    */
-  private BitSetGroup applyNoAndDirectFilter(RawBlockletColumnChunks blockChunkHolder)
-      throws IOException {
+  private BitSetGroup applyNoAndDirectFilter(RawBlockletColumnChunks blockChunkHolder,
+      boolean useBitsetPipeLine) throws IOException {
 
     // In case of Alter Table Add and Delete Columns the isDimensionPresentInCurrentBlock can be
     // false, in that scenario the default values of the column should be shown.
@@ -352,18 +368,43 @@ public class RangeValueFilterExecuterImpl extends ValueBasedFilterExecuterImpl {
     DimensionRawColumnChunk rawColumnChunk =
         blockChunkHolder.getDimensionRawColumnChunks()[chunkIndex];
     BitSetGroup bitSetGroup = new BitSetGroup(rawColumnChunk.getPagesCount());
+    FilterExecuter filterExecuter = null;
+    boolean isExclude = false;
     for (int i = 0; i < rawColumnChunk.getPagesCount(); i++) {
       if (rawColumnChunk.getMaxValues() != null) {
         if (isScanRequired(rawColumnChunk.getMinValues()[i], rawColumnChunk.getMaxValues()[i],
-            this.filterRangesValues)) {
+            this.filterRangesValues, rawColumnChunk.getMinMaxFlagArray()[i])) {
           if (isRangeFullyCoverBlock) {
             // Set all the bits in this case as filter Min Max values cover the whole block.
             BitSet bitSet = new BitSet(rawColumnChunk.getRowCount()[i]);
             bitSet.flip(0, rawColumnChunk.getRowCount()[i]);
             bitSetGroup.setBitSet(bitSet, i);
           } else {
-            BitSet bitSet = getFilteredIndexes(rawColumnChunk.decodeColumnPage(i),
-                rawColumnChunk.getRowCount()[i]);
+            BitSet bitSet;
+            DimensionColumnPage dimensionColumnPage = rawColumnChunk.decodeColumnPage(i);
+            if (null != rawColumnChunk.getLocalDictionary()) {
+              if (null == filterExecuter) {
+                filterExecuter = FilterUtil
+                    .getFilterExecutorForRangeFilters(rawColumnChunk, exp, isNaturalSorted);
+                if (filterExecuter instanceof ExcludeFilterExecuterImpl) {
+                  isExclude = true;
+                }
+              }
+              if (!isExclude) {
+                bitSet = ((IncludeFilterExecuterImpl) filterExecuter)
+                    .getFilteredIndexes(dimensionColumnPage,
+                        rawColumnChunk.getRowCount()[i], useBitsetPipeLine,
+                        blockChunkHolder.getBitSetGroup(), i);
+              } else {
+                bitSet = ((ExcludeFilterExecuterImpl) filterExecuter)
+                    .getFilteredIndexes(dimensionColumnPage,
+                        rawColumnChunk.getRowCount()[i], useBitsetPipeLine,
+                        blockChunkHolder.getBitSetGroup(), i);
+              }
+            } else {
+              bitSet = getFilteredIndexes(dimensionColumnPage,
+                  rawColumnChunk.getRowCount()[i]);
+            }
             bitSetGroup.setBitSet(bitSet, i);
           }
         }
@@ -586,7 +627,7 @@ public class RangeValueFilterExecuterImpl extends ValueBasedFilterExecuterImpl {
           defaultValue = FilterUtil.getMaskKey(key, currentBlockDimension,
               this.segmentProperties.getSortColumnsGenerator());
         } else {
-          defaultValue = ByteUtil.toBytes(key);
+          defaultValue = ByteUtil.toXorBytes(key);
         }
       } else {
         if (dimColEvaluatorInfo.getDimension().getDataType() == DataTypes.STRING) {

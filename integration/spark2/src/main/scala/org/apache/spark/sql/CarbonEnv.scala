@@ -19,15 +19,13 @@ package org.apache.spark.sql
 
 import java.util.concurrent.ConcurrentHashMap
 
-import scala.util.Try
-
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.catalyst.catalog.SessionCatalog
+import org.apache.spark.sql.events.{MergeBloomIndexEventListener, MergeIndexEventListener}
 import org.apache.spark.sql.execution.command.preaaggregate._
 import org.apache.spark.sql.execution.command.timeseries.TimeSeriesFunction
-import org.apache.spark.sql.hive.{HiveSessionCatalog, _}
-import org.apache.spark.util.CarbonReflectionUtils
+import org.apache.spark.sql.hive._
 
 import org.apache.carbondata.common.logging.LogServiceFactory
 import org.apache.carbondata.core.constants.CarbonCommonConstants
@@ -38,7 +36,7 @@ import org.apache.carbondata.core.metadata.schema.table.CarbonTable
 import org.apache.carbondata.core.util._
 import org.apache.carbondata.datamap.{TextMatchMaxDocUDF, TextMatchUDF}
 import org.apache.carbondata.events._
-import org.apache.carbondata.processing.loading.events.LoadEvents.{LoadMetadataEvent, LoadTablePostStatusUpdateEvent, LoadTablePreExecutionEvent, LoadTablePreStatusUpdateEvent}
+import org.apache.carbondata.processing.loading.events.LoadEvents.{LoadMetadataEvent, LoadTablePostExecutionEvent, LoadTablePostStatusUpdateEvent, LoadTablePreExecutionEvent, LoadTablePreStatusUpdateEvent}
 import org.apache.carbondata.spark.rdd.SparkReadSupport
 import org.apache.carbondata.spark.readsupport.SparkRowReadSupportImpl
 
@@ -91,10 +89,16 @@ class CarbonEnv {
         // update carbon session parameters , preserve thread parameters
         val currentThreadSesssionInfo = ThreadLocalSessionInfo.getCarbonSessionInfo
         carbonSessionInfo = new CarbonSessionInfo()
+        // We should not corrupt the information in carbonSessionInfo object which is at the
+        // session level. Instead create a new object and in that set the user specified values in
+        // thread/session params
+        val threadLevelCarbonSessionInfo = new CarbonSessionInfo()
         if (currentThreadSesssionInfo != null) {
-          carbonSessionInfo.setThreadParams(currentThreadSesssionInfo.getThreadParams)
+          threadLevelCarbonSessionInfo.setThreadParams(currentThreadSesssionInfo.getThreadParams)
         }
-        ThreadLocalSessionInfo.setCarbonSessionInfo(carbonSessionInfo)
+        ThreadLocalSessionInfo.setCarbonSessionInfo(threadLevelCarbonSessionInfo)
+        ThreadLocalSessionInfo.setConfigurationToCurrentThread(sparkSession
+          .sessionState.newHadoopConf())
         val config = new CarbonSQLConf(sparkSession)
         if (sparkSession.conf.getOption(CarbonCommonConstants.ENABLE_UNSAFE_SORT).isEmpty) {
           config.addDefaultCarbonParams()
@@ -110,7 +114,8 @@ class CarbonEnv {
 
           CarbonMetaStoreFactory.createCarbonMetaStore(sparkSession.conf)
         }
-        CarbonProperties.getInstance.addProperty(CarbonCommonConstants.IS_DRIVER_INSTANCE, "true")
+        CarbonProperties.getInstance
+          .addNonSerializableProperty(CarbonCommonConstants.IS_DRIVER_INSTANCE, "true")
         initialized = true
       }
     }
@@ -146,7 +151,6 @@ object CarbonEnv {
    */
   def init(sparkSession: SparkSession): Unit = {
     initListeners
-    registerCommonListener(sparkSession)
   }
 
   /**
@@ -161,7 +165,7 @@ object CarbonEnv {
       .addListener(classOf[DeleteFromTablePreEvent], DeletePreAggregatePreListener)
       .addListener(classOf[DeleteFromTablePreEvent], DeletePreAggregatePreListener)
       .addListener(classOf[AlterTableDropColumnPreEvent], PreAggregateDropColumnPreListener)
-      .addListener(classOf[AlterTableRenamePreEvent], PreAggregateRenameTablePreListener)
+      .addListener(classOf[AlterTableRenamePreEvent], RenameTablePreListener)
       .addListener(classOf[AlterTableDataTypeChangePreEvent], PreAggregateDataTypeChangePreListener)
       .addListener(classOf[AlterTableAddColumnPreEvent], PreAggregateAddColumnsPreListener)
       .addListener(classOf[LoadTablePreExecutionEvent], LoadPreAggregateTablePreListener)
@@ -176,14 +180,10 @@ object CarbonEnv {
       .addListener(classOf[AlterTableDropPartitionPostStatusEvent],
         AlterTableDropPartitionPostStatusListener)
       .addListener(classOf[AlterTableDropPartitionMetaEvent], AlterTableDropPartitionMetaListener)
-  }
-
-  def registerCommonListener(sparkSession: SparkSession): Unit = {
-    val clsName = Try(sparkSession.sparkContext.conf
-      .get(CarbonCommonConstants.CARBON_COMMON_LISTENER_REGISTER_CLASSNAME)).toOption.getOrElse("")
-    if (null != clsName && !clsName.isEmpty) {
-      CarbonReflectionUtils.createObject(clsName)
-    }
+      .addListener(classOf[LoadTablePostExecutionEvent], new MergeIndexEventListener)
+      .addListener(classOf[AlterTableCompactionPostEvent], new MergeIndexEventListener)
+      .addListener(classOf[AlterTableMergeIndexEvent], new MergeIndexEventListener)
+      .addListener(classOf[BuildDataMapPostExecutionEvent], new MergeBloomIndexEventListener)
   }
 
   /**
@@ -212,14 +212,16 @@ object CarbonEnv {
     var isRefreshed = false
     val carbonEnv = getInstance(sparkSession)
     val table = carbonEnv.carbonMetastore.getTableFromMetadataCache(
-      identifier.database.getOrElse("default"), identifier.table)
-    if (table.isEmpty ||
-        (table.isDefined && carbonEnv.carbonMetastore
-          .checkSchemasModifiedTimeAndReloadTable(identifier))) {
+      identifier.database.getOrElse(sparkSession.sessionState.catalog.getCurrentDatabase),
+      identifier.table)
+    if (carbonEnv.carbonMetastore
+          .checkSchemasModifiedTimeAndReloadTable(identifier)  && table.isDefined) {
       sparkSession.sessionState.catalog.refreshTable(identifier)
+      val tablePath = table.get.getTablePath
       DataMapStoreManager.getInstance().
-        clearDataMaps(AbsoluteTableIdentifier.from(CarbonProperties.getStorePath,
-          identifier.database.getOrElse("default"), identifier.table))
+        clearDataMaps(AbsoluteTableIdentifier.from(tablePath,
+          identifier.database.getOrElse(sparkSession.sessionState.catalog.getCurrentDatabase),
+          identifier.table, table.get.getTableInfo.getFactTable.getTableId))
       isRefreshed = true
     }
     isRefreshed

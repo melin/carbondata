@@ -19,8 +19,16 @@ package org.apache.carbondata.examples.sdk;
 
 import org.apache.carbondata.common.logging.LogService;
 import org.apache.carbondata.common.logging.LogServiceFactory;
+import org.apache.carbondata.core.constants.CarbonLoadOptionConstants;
 import org.apache.carbondata.core.metadata.datatype.DataTypes;
+import org.apache.carbondata.core.scan.expression.ColumnExpression;
+import org.apache.carbondata.core.scan.expression.LiteralExpression;
+import org.apache.carbondata.core.scan.expression.conditional.EqualToExpression;
+import org.apache.carbondata.core.util.CarbonProperties;
 import org.apache.carbondata.sdk.file.*;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.s3a.Constants;
 
 /**
  * Example for testing CarbonWriter on S3
@@ -29,10 +37,16 @@ public class SDKS3Example {
     public static void main(String[] args) throws Exception {
         LogService logger = LogServiceFactory.getLogService(SDKS3Example.class.getName());
         if (args == null || args.length < 3) {
-            logger.error("Usage: java CarbonS3Example: <access-key> <secret-key>" +
-                    "<s3-endpoint> [table-path-on-s3] [persistSchema] [transactionalTable]");
+            logger.error("Usage: java CarbonS3Example: <access-key> <secret-key>"
+                + "<s3-endpoint> [table-path-on-s3] [rows]");
             System.exit(0);
         }
+
+        String backupProperty = CarbonProperties.getInstance()
+            .getProperty(CarbonLoadOptionConstants.ENABLE_CARBON_LOAD_DIRECT_WRITE_TO_STORE_PATH,
+                CarbonLoadOptionConstants.ENABLE_CARBON_LOAD_DIRECT_WRITE_TO_STORE_PATH_DEFAULT);
+        CarbonProperties.getInstance()
+            .addProperty(CarbonLoadOptionConstants.ENABLE_CARBON_LOAD_DIRECT_WRITE_TO_STORE_PATH, "true");
 
         String path = "s3a://sdk/WriterOutput";
         if (args.length > 3) {
@@ -44,50 +58,33 @@ public class SDKS3Example {
             num = Integer.parseInt(args[4]);
         }
 
-        Boolean persistSchema = true;
-        if (args.length > 5) {
-            if (args[5].equalsIgnoreCase("true")) {
-                persistSchema = true;
-            } else {
-                persistSchema = false;
-            }
-        }
-
-        Boolean transactionalTable = true;
-        if (args.length > 6) {
-            if (args[6].equalsIgnoreCase("true")) {
-                transactionalTable = true;
-            } else {
-                transactionalTable = false;
-            }
-        }
+        Configuration conf = new Configuration(false);
+        conf.set(Constants.ACCESS_KEY, args[0]);
+        conf.set(Constants.SECRET_KEY, args[1]);
+        conf.set(Constants.ENDPOINT, args[2]);
 
         Field[] fields = new Field[2];
         fields[0] = new Field("name", DataTypes.STRING);
         fields[1] = new Field("age", DataTypes.INT);
-        CarbonWriterBuilder builder = CarbonWriter.builder()
-                .withSchema(new Schema(fields))
-                .setAccessKey(args[0])
-                .setSecretKey(args[1])
-                .setEndPoint(args[2])
-                .outputPath(path)
-                .persistSchemaFile(persistSchema)
-                .isTransactionalTable(transactionalTable);
-
-        CarbonWriter writer = builder.buildWriterForCSVInput();
+        CarbonWriterBuilder builder = CarbonWriter.builder().outputPath(path).withHadoopConf(conf);
+        CarbonWriter writer = builder.withCsvInput(new Schema(fields)).build();
 
         for (int i = 0; i < num; i++) {
             writer.write(new String[]{"robot" + (i % 10), String.valueOf(i)});
         }
         writer.close();
         // Read data
+
+        EqualToExpression equalToExpression = new EqualToExpression(
+            new ColumnExpression("name", DataTypes.STRING),
+            new LiteralExpression("robot1", DataTypes.STRING));
+
         CarbonReader reader = CarbonReader
-                .builder(path, "_temp")
-                .projection(new String[]{"name", "age"})
-                .setAccessKey(args[0])
-                .setSecretKey(args[1])
-                .setEndPoint(args[2])
-                .build();
+            .builder(path, "_temp")
+            .projection(new String[]{"name", "age"})
+            .filter(equalToExpression)
+            .withHadoopConf(conf)
+            .build();
 
         System.out.println("\nData:");
         int i = 0;
@@ -97,7 +94,10 @@ public class SDKS3Example {
             i++;
         }
         System.out.println("\nFinished");
-        // TODO
-        //        reader.close();
+        reader.close();
+
+        CarbonProperties.getInstance()
+            .addProperty(CarbonLoadOptionConstants.ENABLE_CARBON_LOAD_DIRECT_WRITE_TO_STORE_PATH,
+                backupProperty);
     }
 }

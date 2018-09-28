@@ -44,8 +44,9 @@ import org.apache.carbondata.processing.loading.steps.CarbonRowDataWriterProcess
 import org.apache.carbondata.processing.loading.steps.DataConverterProcessorStepImpl;
 import org.apache.carbondata.processing.loading.steps.DataWriterBatchProcessorStepImpl;
 import org.apache.carbondata.processing.loading.steps.DataWriterProcessorStepImpl;
-import org.apache.carbondata.processing.loading.steps.InputProcessorStepForPartitionImpl;
 import org.apache.carbondata.processing.loading.steps.InputProcessorStepImpl;
+import org.apache.carbondata.processing.loading.steps.InputProcessorStepWithNoConverterImpl;
+import org.apache.carbondata.processing.loading.steps.JsonInputProcessorStepImpl;
 import org.apache.carbondata.processing.loading.steps.SortProcessorStepImpl;
 import org.apache.carbondata.processing.util.CarbonDataProcessorUtil;
 
@@ -62,10 +63,12 @@ public final class DataLoadProcessBuilder {
       CarbonIterator[] inputIterators) throws Exception {
     CarbonDataLoadConfiguration configuration = createConfiguration(loadModel, storeLocation);
     SortScopeOptions.SortScope sortScope = CarbonDataProcessorUtil.getSortScope(configuration);
-    if (loadModel.isPartitionLoad()) {
-      return buildInternalForPartitionLoad(inputIterators, configuration, sortScope);
-    } else if (!configuration.isSortTable() ||
-        sortScope.equals(SortScopeOptions.SortScope.NO_SORT)) {
+    if (loadModel.isLoadWithoutConverterStep()) {
+      return buildInternalWithNoConverter(inputIterators, configuration, sortScope);
+    } else if (loadModel.isJsonFileLoad()) {
+      return buildInternalWithJsonInputProcessor(inputIterators, configuration, sortScope);
+    } else if (!configuration.isSortTable() || sortScope.equals(
+        SortScopeOptions.SortScope.NO_SORT)) {
       return buildInternalForNoSort(inputIterators, configuration);
     } else if (configuration.getBucketingInfo() != null) {
       return buildInternalForBucketing(inputIterators, configuration);
@@ -106,14 +109,14 @@ public final class DataLoadProcessBuilder {
   }
 
   /**
-   * Build pipe line for partition load
+   * Build pipe line for Load without Conversion Step.
    */
-  private AbstractDataLoadProcessorStep buildInternalForPartitionLoad(
+  private AbstractDataLoadProcessorStep buildInternalWithNoConverter(
       CarbonIterator[] inputIterators, CarbonDataLoadConfiguration configuration,
       SortScopeOptions.SortScope sortScope) {
     // Wraps with dummy processor.
     AbstractDataLoadProcessorStep inputProcessorStep =
-        new InputProcessorStepForPartitionImpl(configuration, inputIterators);
+        new InputProcessorStepWithNoConverterImpl(configuration, inputIterators);
     if (sortScope.equals(SortScopeOptions.SortScope.LOCAL_SORT)) {
       AbstractDataLoadProcessorStep sortProcessorStep =
           new SortProcessorStepImpl(configuration, inputProcessorStep);
@@ -128,6 +131,36 @@ public final class DataLoadProcessBuilder {
     } else {
       // In all other cases like global sort and no sort uses this step
       return new CarbonRowDataWriterProcessorStepImpl(configuration, inputProcessorStep);
+    }
+  }
+
+  /**
+   * Build pipe line for Load with json input processor.
+   */
+  private AbstractDataLoadProcessorStep buildInternalWithJsonInputProcessor(
+      CarbonIterator[] inputIterators, CarbonDataLoadConfiguration configuration,
+      SortScopeOptions.SortScope sortScope) {
+    // currently row by row conversion of string json to carbon row is supported.
+    AbstractDataLoadProcessorStep inputProcessorStep =
+        new JsonInputProcessorStepImpl(configuration, inputIterators);
+    // 2. Converts the data like dictionary or non dictionary or complex objects depends on
+    // data types and configurations.
+    AbstractDataLoadProcessorStep converterProcessorStep =
+        new DataConverterProcessorStepImpl(configuration, inputProcessorStep);
+    if (sortScope.equals(SortScopeOptions.SortScope.LOCAL_SORT)) {
+      AbstractDataLoadProcessorStep sortProcessorStep =
+          new SortProcessorStepImpl(configuration, converterProcessorStep);
+      //  Writes the sorted data in carbondata format.
+      return new DataWriterProcessorStepImpl(configuration, sortProcessorStep);
+    } else if (sortScope.equals(SortScopeOptions.SortScope.BATCH_SORT)) {
+      //  Sorts the data by SortColumn or not
+      AbstractDataLoadProcessorStep sortProcessorStep =
+          new SortProcessorStepImpl(configuration, converterProcessorStep);
+      // Writes the sorted data in carbondata format.
+      return new DataWriterBatchProcessorStepImpl(configuration, sortProcessorStep);
+    } else {
+      // In all other cases like global sort and no sort uses this step
+      return new CarbonRowDataWriterProcessorStepImpl(configuration, converterProcessorStep);
     }
   }
 
@@ -174,8 +207,6 @@ public final class DataLoadProcessBuilder {
             loadModel.getTaskNo(), false, false);
     CarbonProperties.getInstance().addProperty(tempLocationKey,
         StringUtils.join(storeLocation, File.pathSeparator));
-    CarbonProperties.getInstance()
-        .addProperty(CarbonCommonConstants.STORE_LOCATION_HDFS, loadModel.getTablePath());
 
     return createConfiguration(loadModel);
   }
@@ -184,6 +215,7 @@ public final class DataLoadProcessBuilder {
     CarbonDataLoadConfiguration configuration = new CarbonDataLoadConfiguration();
     CarbonTable carbonTable = loadModel.getCarbonDataLoadSchema().getCarbonTable();
     AbsoluteTableIdentifier identifier = carbonTable.getAbsoluteTableIdentifier();
+    configuration.setParentTablePath(loadModel.getParentTablePath());
     configuration.setTableIdentifier(identifier);
     configuration.setCarbonTransactionalTable(loadModel.isCarbonTransactionalTable());
     configuration.setSchemaUpdatedTimeStamp(carbonTable.getTableLastUpdatedTime());
@@ -207,6 +239,7 @@ public final class DataLoadProcessBuilder {
         loadModel.getSkipEmptyLine());
     configuration.setDataLoadProperty(DataLoadProcessorConstants.FACT_FILE_PATH,
         loadModel.getFactFilePath());
+    configuration.setParentTablePath(loadModel.getParentTablePath());
     configuration
         .setDataLoadProperty(CarbonCommonConstants.LOAD_SORT_SCOPE, loadModel.getSortScope());
     configuration.setDataLoadProperty(CarbonCommonConstants.LOAD_BATCH_SORT_SIZE_INMB,
@@ -230,11 +263,22 @@ public final class DataLoadProcessBuilder {
       DataField dataField = new DataField(column);
       if (column.getDataType() == DataTypes.DATE) {
         dataField.setDateFormat(loadModel.getDateFormat());
+        column.setDateFormat(loadModel.getDateFormat());
       } else if (column.getDataType() == DataTypes.TIMESTAMP) {
         dataField.setTimestampFormat(loadModel.getTimestampformat());
+        column.setTimestampFormat(loadModel.getTimestampformat());
       }
       if (column.isComplex()) {
         complexDataFields.add(dataField);
+        List<CarbonDimension> childDimensions =
+            ((CarbonDimension) dataField.getColumn()).getListOfChildDimensions();
+        for (CarbonDimension childDimension : childDimensions) {
+          if (childDimension.getDataType() == DataTypes.DATE) {
+            childDimension.setDateFormat(loadModel.getDateFormat());
+          } else if (childDimension.getDataType() == DataTypes.TIMESTAMP) {
+            childDimension.setTimestampFormat(loadModel.getTimestampformat());
+          }
+        }
       } else {
         dataFields.add(dataField);
       }
@@ -267,6 +311,10 @@ public final class DataLoadProcessBuilder {
     }
     TableSpec tableSpec = new TableSpec(carbonTable);
     configuration.setTableSpec(tableSpec);
+    if (loadModel.getSdkWriterCores() > 0) {
+      configuration.setWritingCoresCount(loadModel.getSdkWriterCores());
+    }
+    configuration.setColumnCompressor(loadModel.getColumnCompressor());
     return configuration;
   }
 

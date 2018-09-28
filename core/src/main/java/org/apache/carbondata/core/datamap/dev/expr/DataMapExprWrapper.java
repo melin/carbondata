@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.io.Serializable;
 import java.util.List;
 
+import org.apache.carbondata.core.datamap.DataMapDistributable;
 import org.apache.carbondata.core.datamap.DataMapLevel;
 import org.apache.carbondata.core.datamap.Segment;
 import org.apache.carbondata.core.indexstore.ExtendedBlocklet;
@@ -38,6 +39,18 @@ public interface DataMapExprWrapper extends Serializable {
    */
   List<ExtendedBlocklet> prune(List<Segment> segments, List<PartitionSpec> partitionsToPrune)
       throws IOException;
+
+  /**
+   * prune blocklet according distributable
+   *
+   * @param distributable     distributable
+   * @param partitionsToPrune partitions to prune
+   * @return the pruned ExtendedBlocklet list
+   * @throws IOException
+   */
+  List<ExtendedBlocklet> prune(DataMapDistributable distributable,
+      List<PartitionSpec> partitionsToPrune)
+          throws IOException;
 
   /**
    * It is used in case on distributable datamap. First using job it gets all blockets from all
@@ -71,9 +84,17 @@ public interface DataMapExprWrapper extends Serializable {
   FilterResolverIntf getFilterResolverIntf(String uniqueId);
 
   /**
-   * Get the datamap type.
-   * @return
+   * Get the datamap level.
    */
-  DataMapLevel getDataMapType();
+  DataMapLevel getDataMapLevel();
 
+  /**
+   * get the left datamap wrapper
+   */
+  DataMapExprWrapper getLeftDataMapWrapper();
+
+  /**
+   * get the right datamap wrapper
+   */
+  DataMapExprWrapper getRightDataMapWrapprt();
 }

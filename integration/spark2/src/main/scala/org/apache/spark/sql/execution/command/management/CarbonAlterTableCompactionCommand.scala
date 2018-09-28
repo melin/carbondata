@@ -18,6 +18,7 @@
 package org.apache.spark.sql.execution.command.management
 
 import java.io.{File, IOException}
+import java.util
 
 import scala.collection.JavaConverters._
 
@@ -25,7 +26,7 @@ import org.apache.spark.sql.{CarbonEnv, Row, SparkSession, SQLContext}
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.execution.command.{AlterTableModel, AtomicRunnableCommand, CarbonMergerMapping, CompactionModel}
-import org.apache.spark.sql.hive.{CarbonRelation}
+import org.apache.spark.sql.hive.{CarbonRelation, CarbonSessionCatalog}
 import org.apache.spark.sql.optimizer.CarbonFilters
 import org.apache.spark.sql.util.CarbonException
 import org.apache.spark.util.AlterTableUtil
@@ -33,9 +34,11 @@ import org.apache.spark.util.AlterTableUtil
 import org.apache.carbondata.common.exceptions.sql.MalformedCarbonCommandException
 import org.apache.carbondata.common.logging.{LogService, LogServiceFactory}
 import org.apache.carbondata.core.constants.CarbonCommonConstants
+import org.apache.carbondata.core.datastore.compression.CompressorFactory
 import org.apache.carbondata.core.datastore.impl.FileFactory
 import org.apache.carbondata.core.exception.ConcurrentOperationException
 import org.apache.carbondata.core.locks.{CarbonLockFactory, LockUsage}
+import org.apache.carbondata.core.metadata.ColumnarFormatVersion
 import org.apache.carbondata.core.metadata.schema.table.{CarbonTable, TableInfo}
 import org.apache.carbondata.core.mutate.CarbonUpdateUtil
 import org.apache.carbondata.core.statusmanager.SegmentStatusManager
@@ -81,6 +84,12 @@ case class CarbonAlterTableCompactionCommand(
       throw new MalformedCarbonCommandException("Unsupported operation on non transactional table")
     }
 
+    if (table.getTableInfo.getFactTable.getListOfColumns.asScala
+      .exists(m => m.getDataType.isComplexType)) {
+      throw new UnsupportedOperationException(
+        "Compaction is unsupported for Table containing Complex Columns")
+    }
+
     if (CarbonUtil.hasAggregationDataMap(table) ||
         (table.isChildDataMap && null == operationContext.getProperty(table.getTableName))) {
       // If the compaction request is of 'streaming' type then we need to generate loadCommands
@@ -101,25 +110,47 @@ case class CarbonAlterTableCompactionCommand(
     if (SegmentStatusManager.isOverwriteInProgressInTable(table)) {
       throw new ConcurrentOperationException(table, "insert overwrite", "compaction")
     }
-    operationContext.setProperty("compactionException", "true")
     var compactionType: CompactionType = null
-    var compactionException = "true"
     try {
       compactionType = CompactionType.valueOf(alterTableModel.compactionType.toUpperCase)
     } catch {
       case _: Exception =>
-        val alterTableCompactionExceptionEvent: AlterTableCompactionExceptionEvent =
-          AlterTableCompactionExceptionEvent(sparkSession, table, alterTableModel)
-        OperationListenerBus.getInstance
-          .fireEvent(alterTableCompactionExceptionEvent, operationContext)
-        compactionException = operationContext.getProperty("compactionException").toString
+        throw new MalformedCarbonCommandException(
+          "Unsupported alter operation on carbon table")
     }
-    if (compactionException.equalsIgnoreCase("true") && null == compactionType) {
-      throw new MalformedCarbonCommandException(
-        "Unsupported alter operation on carbon table")
-    } else if (compactionException.equalsIgnoreCase("false")) {
+    if (compactionType == CompactionType.SEGMENT_INDEX) {
+      if (table.isStreamingSink) {
+        throw new MalformedCarbonCommandException(
+          "Unsupported alter operation on carbon table: Merge index is not supported on streaming" +
+          " table")
+      }
+      val version = CarbonUtil.getFormatVersion(table)
+      val isOlderVersion = version == ColumnarFormatVersion.V1 ||
+                           version == ColumnarFormatVersion.V2
+      if (isOlderVersion) {
+        throw new MalformedCarbonCommandException(
+          "Unsupported alter operation on carbon table: Merge index is not supported on V1 V2 " +
+          "store segments")
+      }
+
+      val alterTableMergeIndexEvent: AlterTableMergeIndexEvent =
+        AlterTableMergeIndexEvent(sparkSession, table, alterTableModel)
+      OperationListenerBus.getInstance
+        .fireEvent(alterTableMergeIndexEvent, operationContext)
       Seq.empty
     } else {
+
+      if (compactionType != CompactionType.CUSTOM &&
+        alterTableModel.customSegmentIds.isDefined) {
+        throw new MalformedCarbonCommandException(
+          s"Custom segments not supported when doing ${compactionType.toString} compaction")
+      }
+      if (compactionType == CompactionType.CUSTOM &&
+        alterTableModel.customSegmentIds.isEmpty) {
+        throw new MalformedCarbonCommandException(
+          s"Segment ids should not be empty when doing ${compactionType.toString} compaction")
+      }
+
       val carbonLoadModel = new CarbonLoadModel()
       carbonLoadModel.setTableName(table.getTableName)
       val dataLoadSchema = new CarbonDataLoadSchema(table)
@@ -129,6 +160,10 @@ case class CarbonAlterTableCompactionCommand(
       carbonLoadModel.setCarbonTransactionalTable(table.isTransactionalTable)
       carbonLoadModel.setDatabaseName(table.getDatabaseName)
       carbonLoadModel.setTablePath(table.getTablePath)
+      val columnCompressor = table.getTableInfo.getFactTable.getTableProperties.asScala
+        .getOrElse(CarbonCommonConstants.COMPRESSOR,
+          CompressorFactory.getInstance().getCompressor.getName)
+      carbonLoadModel.setColumnCompressor(columnCompressor)
 
       var storeLocation = System.getProperty("java.io.tmpdir")
       storeLocation = storeLocation + "/carbonstore/" + System.nanoTime()
@@ -136,12 +171,14 @@ case class CarbonAlterTableCompactionCommand(
       val alterTableCompactionPreEvent: AlterTableCompactionPreEvent =
         AlterTableCompactionPreEvent(sparkSession, table, null, null)
       OperationListenerBus.getInstance.fireEvent(alterTableCompactionPreEvent, operationContext)
+      val compactedSegments: java.util.List[String] = new util.ArrayList[String]()
       try {
         alterTableForCompaction(
           sparkSession.sqlContext,
           alterTableModel,
           carbonLoadModel,
           storeLocation,
+          compactedSegments,
           operationContext)
       } catch {
         case e: Exception =>
@@ -155,7 +192,7 @@ case class CarbonAlterTableCompactionCommand(
       }
       // trigger event for compaction
       val alterTableCompactionPostEvent: AlterTableCompactionPostEvent =
-        AlterTableCompactionPostEvent(sparkSession, table, null, null)
+        AlterTableCompactionPostEvent(sparkSession, table, null, compactedSegments)
       OperationListenerBus.getInstance.fireEvent(alterTableCompactionPostEvent, operationContext)
       Seq.empty
     }
@@ -165,6 +202,7 @@ case class CarbonAlterTableCompactionCommand(
       alterTableModel: AlterTableModel,
       carbonLoadModel: CarbonLoadModel,
       storeLocation: String,
+      compactedSegments: java.util.List[String],
       operationContext: OperationContext): Unit = {
     val LOGGER: LogService = LogServiceFactory.getLogService(this.getClass.getName)
     val compactionType = CompactionType.valueOf(alterTableModel.compactionType.toUpperCase)
@@ -212,13 +250,20 @@ case class CarbonAlterTableCompactionCommand(
     carbonLoadModel.setFactTimeStamp(loadStartTime)
 
     val isCompactionTriggerByDDl = true
+    val segmentIds: Option[List[String]] = if (compactionType == CompactionType.CUSTOM &&
+      alterTableModel.customSegmentIds.isDefined) {
+      alterTableModel.customSegmentIds
+    } else {
+      None
+    }
     val compactionModel = CompactionModel(compactionSize,
       compactionType,
       carbonTable,
       isCompactionTriggerByDDl,
       CarbonFilters.getCurrentPartitions(sqlContext.sparkSession,
-        TableIdentifier(carbonTable.getTableName,
-        Some(carbonTable.getDatabaseName)))
+      TableIdentifier(carbonTable.getTableName,
+      Some(carbonTable.getDatabaseName))),
+      segmentIds
     )
 
     val isConcurrentCompactionAllowed = CarbonProperties.getInstance()
@@ -238,6 +283,7 @@ case class CarbonAlterTableCompactionCommand(
         storeLocation,
         compactionType,
         carbonTable,
+        compactedSegments,
         compactionModel,
         operationContext
       )
@@ -257,6 +303,7 @@ case class CarbonAlterTableCompactionCommand(
             storeLocation,
             compactionModel,
             lock,
+            compactedSegments,
             operationContext
           )
         } catch {
@@ -283,10 +330,17 @@ case class CarbonAlterTableCompactionCommand(
   ): Unit = {
     val LOGGER: LogService = LogServiceFactory.getLogService(this.getClass.getName)
     val carbonTable = carbonLoadModel.getCarbonDataLoadSchema.getCarbonTable
-    // 1. acquire lock of streaming.lock
+    // 1. delete the lock of streaming.lock, forcing the stream to be closed
     val streamingLock = CarbonLockFactory.getCarbonLockObj(
       carbonTable.getTableInfo.getOrCreateAbsoluteTableIdentifier,
       LockUsage.STREAMING_LOCK)
+    val lockFile =
+      FileFactory.getCarbonFile(streamingLock.getLockFilePath, FileFactory.getConfiguration)
+    if (lockFile.exists()) {
+      if (!lockFile.delete()) {
+        LOGGER.warn("failed to delete lock file: " + streamingLock.getLockFilePath)
+      }
+    }
     try {
       if (streamingLock.lockWithRetries()) {
         // 2. convert segment status from "streaming" to "streaming finish"
@@ -300,7 +354,8 @@ case class CarbonAlterTableCompactionCommand(
           tableIdentifier,
           Map("streaming" -> "false"),
           Seq.empty,
-          true)(sparkSession)
+          true)(sparkSession,
+          sparkSession.sessionState.catalog.asInstanceOf[CarbonSessionCatalog])
         // 5. remove checkpoint
         FileFactory.deleteAllFilesOfDir(
           new File(CarbonTablePath.getStreamingCheckpointDir(carbonTable.getTablePath)))

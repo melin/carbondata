@@ -62,12 +62,17 @@ public class UnsafeBatchParallelReadMergeSorterImpl extends AbstractMergeSorter 
 
   private AtomicLong rowCounter;
 
+  /* will be incremented for each batch. This ID is used in sort temp files name,
+   to identify files of that batch */
+  private AtomicInteger batchId;
+
   public UnsafeBatchParallelReadMergeSorterImpl(AtomicLong rowCounter) {
     this.rowCounter = rowCounter;
   }
 
   @Override public void initialize(SortParameters sortParameters) {
     this.sortParameters = sortParameters;
+    batchId = new AtomicInteger(0);
 
   }
 
@@ -164,13 +169,15 @@ public class UnsafeBatchParallelReadMergeSorterImpl extends AbstractMergeSorter 
         LOGGER.error(e);
         this.threadStatusObserver.notifyFailed(e);
       } finally {
-        sortDataRows.finishThread();
+        synchronized (sortDataRows) {
+          sortDataRows.finishThread();
+        }
       }
     }
 
   }
 
-  private static class SortBatchHolder
+  private class SortBatchHolder
       extends CarbonIterator<UnsafeSingleThreadFinalSortFilesMerger> {
 
     private SortParameters sortParameters;
@@ -191,7 +198,7 @@ public class UnsafeBatchParallelReadMergeSorterImpl extends AbstractMergeSorter 
 
     private final Object lock = new Object();
 
-    public SortBatchHolder(SortParameters sortParameters, int numberOfThreads,
+    SortBatchHolder(SortParameters sortParameters, int numberOfThreads,
         ThreadStatusObserver threadStatusObserver) {
       this.sortParameters = sortParameters.getCopy();
       this.iteratorCount = new AtomicInteger(numberOfThreads);
@@ -201,6 +208,12 @@ public class UnsafeBatchParallelReadMergeSorterImpl extends AbstractMergeSorter 
     }
 
     private void createSortDataRows() {
+      // For each batch, createSortDataRows() will be called.
+      // Files saved to disk during sorting of previous batch,should not be considered
+      // for this batch.
+      // Hence use batchID as rangeID field of sorttempfiles.
+      // so getFilesToMergeSort() will select only this batch files.
+      this.sortParameters.setRangeId(batchId.incrementAndGet());
       int inMemoryChunkSizeInMB = CarbonProperties.getInstance().getSortMemoryChunkSizeInMB();
       setTempLocation(sortParameters);
       this.finalMerger = new UnsafeSingleThreadFinalSortFilesMerger(sortParameters,
@@ -307,14 +320,6 @@ public class UnsafeBatchParallelReadMergeSorterImpl extends AbstractMergeSorter 
      */
     private boolean processRowToNextStep(UnsafeSortDataRows sortDataRows, SortParameters parameters)
         throws CarbonDataLoadingException {
-      if (null == sortDataRows) {
-        LOGGER.info("Record Processed For table: " + parameters.getTableName());
-        LOGGER.info("Number of Records was Zero");
-        String logMessage = "Summary: Carbon Sort Key Step: Read: " + 0 + ": Write: " + 0;
-        LOGGER.info(logMessage);
-        return false;
-      }
-
       try {
         // start sorting
         sortDataRows.startSorting();
@@ -331,6 +336,5 @@ public class UnsafeBatchParallelReadMergeSorterImpl extends AbstractMergeSorter 
         throw new CarbonDataLoadingException(e);
       }
     }
-
   }
 }

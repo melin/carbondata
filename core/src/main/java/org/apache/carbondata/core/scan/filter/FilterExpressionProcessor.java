@@ -78,10 +78,10 @@ public class FilterExpressionProcessor implements FilterProcessor {
    * @return a filter resolver tree
    */
   public FilterResolverIntf getFilterResolver(Expression expressionTree,
-      AbsoluteTableIdentifier tableIdentifier, TableProvider tableProvider)
+      AbsoluteTableIdentifier tableIdentifier)
       throws FilterUnsupportedException, IOException {
     if (null != expressionTree && null != tableIdentifier) {
-      return getFilterResolvertree(expressionTree, tableIdentifier, tableProvider);
+      return getFilterResolvertree(expressionTree, tableIdentifier);
     }
     return null;
   }
@@ -206,13 +206,16 @@ public class FilterExpressionProcessor implements FilterProcessor {
    * @param dataRefNode
    */
   private void addBlockBasedOnMinMaxValue(FilterExecuter filterExecuter,
-      List<DataRefNode> listOfDataBlocksToScan, DataRefNode dataRefNode) {
-
+      List<DataRefNode> listOfDataBlocksToScan, DataRefNode dataRefNode, boolean[] isMinMaxSet) {
+    if (null == dataRefNode.getColumnsMinValue() || null == dataRefNode.getColumnsMaxValue()) {
+      listOfDataBlocksToScan.add(dataRefNode);
+      return;
+    }
     BitSet bitSet = filterExecuter
-        .isScanRequired(dataRefNode.getColumnsMaxValue(), dataRefNode.getColumnsMinValue());
+        .isScanRequired(dataRefNode.getColumnsMaxValue(), dataRefNode.getColumnsMinValue(),
+            isMinMaxSet);
     if (!bitSet.isEmpty()) {
       listOfDataBlocksToScan.add(dataRefNode);
-
     }
   }
 
@@ -225,11 +228,11 @@ public class FilterExpressionProcessor implements FilterProcessor {
    * @return FilterResolverIntf type.
    */
   private FilterResolverIntf getFilterResolvertree(Expression expressionTree,
-      AbsoluteTableIdentifier tableIdentifier, TableProvider tableProvider)
+      AbsoluteTableIdentifier tableIdentifier)
       throws FilterUnsupportedException, IOException {
     FilterResolverIntf filterEvaluatorTree =
         createFilterResolverTree(expressionTree, tableIdentifier);
-    traverseAndResolveTree(filterEvaluatorTree, tableIdentifier, tableProvider);
+    traverseAndResolveTree(filterEvaluatorTree, tableIdentifier);
     return filterEvaluatorTree;
   }
 
@@ -243,14 +246,14 @@ public class FilterExpressionProcessor implements FilterProcessor {
    * @param tableIdentifier
    */
   private void traverseAndResolveTree(FilterResolverIntf filterResolverTree,
-      AbsoluteTableIdentifier tableIdentifier, TableProvider tableProvider)
+      AbsoluteTableIdentifier tableIdentifier)
       throws FilterUnsupportedException, IOException {
     if (null == filterResolverTree) {
       return;
     }
-    traverseAndResolveTree(filterResolverTree.getLeft(), tableIdentifier, tableProvider);
-    filterResolverTree.resolve(tableIdentifier, tableProvider);
-    traverseAndResolveTree(filterResolverTree.getRight(), tableIdentifier, tableProvider);
+    traverseAndResolveTree(filterResolverTree.getLeft(), tableIdentifier);
+    filterResolverTree.resolve(tableIdentifier);
+    traverseAndResolveTree(filterResolverTree.getRight(), tableIdentifier);
   }
 
   /**
@@ -470,13 +473,13 @@ public class FilterExpressionProcessor implements FilterProcessor {
   }
 
   public static boolean isScanRequired(FilterExecuter filterExecuter, byte[][] maxValue,
-      byte[][] minValue) {
+      byte[][] minValue, boolean[] isMinMaxSet) {
     if (filterExecuter instanceof ImplicitColumnFilterExecutor) {
       return ((ImplicitColumnFilterExecutor) filterExecuter)
-          .isFilterValuesPresentInAbstractIndex(maxValue, minValue);
+          .isFilterValuesPresentInAbstractIndex(maxValue, minValue, isMinMaxSet);
     } else {
       // otherwise decide based on min/max value
-      BitSet bitSet = filterExecuter.isScanRequired(maxValue, minValue);
+      BitSet bitSet = filterExecuter.isScanRequired(maxValue, minValue, isMinMaxSet);
       return !bitSet.isEmpty();
     }
   }

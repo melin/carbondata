@@ -18,8 +18,9 @@
 package org.apache.spark.rpc
 
 import java.io.IOException
-import java.net.InetAddress
+import java.net.{BindException, InetAddress}
 import java.util.{List => JList, Map => JMap, Objects, Random, UUID}
+import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
@@ -37,23 +38,25 @@ import org.apache.spark.util.ThreadUtils
 
 import org.apache.carbondata.common.annotations.InterfaceAudience
 import org.apache.carbondata.common.logging.LogServiceFactory
+import org.apache.carbondata.core.constants.CarbonCommonConstants
 import org.apache.carbondata.core.datastore.block.Distributable
 import org.apache.carbondata.core.datastore.row.CarbonRow
 import org.apache.carbondata.core.metadata.schema.table.CarbonTable
 import org.apache.carbondata.core.scan.expression.Expression
 import org.apache.carbondata.core.util.CarbonProperties
 import org.apache.carbondata.hadoop.CarbonMultiBlockSplit
+import org.apache.carbondata.hadoop.api.CarbonInputFormat
 import org.apache.carbondata.hadoop.util.CarbonInputFormatUtil
 import org.apache.carbondata.processing.util.CarbonLoaderUtil
 import org.apache.carbondata.store.worker.Status
 
 /**
  * Master of CarbonSearch.
- * It listens to [[Master.port]] to wait for worker to register.
+ * It provides a Registry service for worker to register.
  * And it provides search API to fire RPC call to workers.
  */
 @InterfaceAudience.Internal
-class Master(sparkConf: SparkConf, port: Int) {
+class Master(sparkConf: SparkConf) {
   private val LOG = LogServiceFactory.getLogService(this.getClass.getCanonicalName)
 
   // worker host address map to EndpointRef
@@ -64,25 +67,65 @@ class Master(sparkConf: SparkConf, port: Int) {
 
   private val scheduler: Scheduler = new Scheduler
 
-  def this(sparkConf: SparkConf) = {
-    this(sparkConf, CarbonProperties.getSearchMasterPort)
-  }
-
   /** start service and listen on port passed in constructor */
   def startService(): Unit = {
     if (rpcEnv == null) {
+      LOG.info("Start search mode master thread")
+      val isStarted: AtomicBoolean = new AtomicBoolean(false)
       new Thread(new Runnable {
         override def run(): Unit = {
           val hostAddress = InetAddress.getLocalHost.getHostAddress
-          val config = RpcEnvConfig(
-            sparkConf, "registry-service", hostAddress, "", CarbonProperties.getSearchMasterPort,
-            new SecurityManager(sparkConf), clientMode = false)
-          rpcEnv = new NettyRpcEnvFactory().create(config)
+          var port = CarbonProperties.getSearchMasterPort
+          var exception: BindException = null
+          var numTry = 100  // we will try to create service at worse case 100 times
+          do {
+            try {
+              LOG.info(s"starting registry-service on $hostAddress:$port")
+              val config = RpcUtil.getRpcEnvConfig(
+                sparkConf, "registry-service", hostAddress, "", port,
+                new SecurityManager(sparkConf), clientMode = false)
+              rpcEnv = new NettyRpcEnvFactory().create(config)
+              numTry = 0
+            } catch {
+              case e: BindException =>
+                // port is occupied, increase the port number and try again
+                exception = e
+                LOG.error(s"start registry-service failed: ${e.getMessage}")
+                port = port + 1
+                numTry = numTry - 1
+            }
+          } while (numTry > 0)
+          if (rpcEnv == null) {
+            // we have tried many times, but still failed to find an available port
+            throw exception
+          }
           val registryEndpoint: RpcEndpoint = new Registry(rpcEnv, Master.this)
           rpcEnv.setupEndpoint("registry-service", registryEndpoint)
+          if (isStarted.compareAndSet(false, false)) {
+            synchronized {
+              isStarted.compareAndSet(false, true)
+            }
+          }
+          LOG.info("registry-service started")
           rpcEnv.awaitTermination()
         }
       }).start()
+      var count = 0
+      val countThreshold = 5000
+      while (isStarted.compareAndSet(false, false) && count < countThreshold) {
+        LOG.info(s"Waiting search mode master to start, retrying $count times")
+        Thread.sleep(10)
+        count = count + 1;
+      }
+      if (count >= countThreshold) {
+        LOG.error(s"Search mode try $countThreshold times to start master but failed")
+        throw new RuntimeException(
+          s"Search mode try $countThreshold times to start master but failed")
+      } else {
+        LOG.info("Search mode master started")
+      }
+    } else {
+      LOG.info("Search mode master has already started")
     }
   }
 
@@ -175,7 +218,8 @@ class Master(sparkConf: SparkConf, port: Int) {
       // Build a SearchRequest
       val split = new SerializableWritable[CarbonMultiBlockSplit](
         new CarbonMultiBlockSplit(blocks, splitAddress))
-      val request = SearchRequest(queryId, split, table.getTableInfo, columns, filter, localLimit)
+      val request =
+        SearchRequest(queryId, split, table.getTableInfo, columns, filter, localLimit)
 
       // Find an Endpoind and send the request to it
       // This RPC is non-blocking so that we do not need to wait before send to next worker
@@ -187,10 +231,14 @@ class Master(sparkConf: SparkConf, port: Int) {
 
       // if we have enough data already, we do not need to collect more result
       if (rowCount < globalLimit) {
-        // wait for worker for 10s
-        ThreadUtils.awaitResult(future, Duration.apply("10s"))
+        // wait for worker
+        val timeout = CarbonProperties
+          .getInstance()
+          .getProperty(CarbonCommonConstants.CARBON_SEARCH_QUERY_TIMEOUT,
+            CarbonCommonConstants.CARBON_SEARCH_QUERY_TIMEOUT_DEFAULT)
+        ThreadUtils.awaitResult(future, Duration.apply(timeout))
         LOG.info(s"[SearchId:$queryId] receive search response from worker " +
-                 s"${worker.address}:${worker.port}")
+          s"${worker.address}:${worker.port}")
         try {
           future.value match {
             case Some(response: Try[SearchResult]) =>
@@ -210,7 +258,7 @@ class Master(sparkConf: SparkConf, port: Int) {
 
   /**
    * Prune data by using CarbonInputFormat.getSplit
-   * Return a mapping of hostname to list of block
+   * Return a mapping of host address to list of block
    */
   private def pruneBlock(
       table: CarbonTable,
@@ -220,6 +268,9 @@ class Master(sparkConf: SparkConf, port: Int) {
     val job = new Job(jobConf)
     val format = CarbonInputFormatUtil.createCarbonTableInputFormat(
       job, table, columns, filter, null, null)
+
+    // We will do FG pruning in reader side, so don't do it here
+    CarbonInputFormat.setFgDataMapPruning(job.getConfiguration, false)
     val splits = format.getSplits(job)
     val distributables = splits.asScala.map { split =>
       split.asInstanceOf[Distributable]
@@ -228,7 +279,8 @@ class Master(sparkConf: SparkConf, port: Int) {
       distributables.asJava,
       -1,
       getWorkers.asJava,
-      CarbonLoaderUtil.BlockAssignmentStrategy.BLOCK_NUM_FIRST)
+      CarbonLoaderUtil.BlockAssignmentStrategy.BLOCK_NUM_FIRST,
+      null)
   }
 
   /** return hostname of all workers */

@@ -24,7 +24,7 @@ import org.apache.spark.sql.CarbonExpressions.{CarbonSubqueryAlias => SubqueryAl
 import org.apache.spark.sql.CarbonExpressions.MatchCastExpression
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAlias, UnresolvedFunction, UnresolvedRelation}
-import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, AttributeSeq, Cast, Expression, ExprId, NamedExpression, ScalaUDF}
+import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Count, _}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.execution.command.{ColumnTableRelation, DataMapField, Field}
@@ -40,6 +40,7 @@ import org.apache.carbondata.common.logging.{LogService, LogServiceFactory}
 import org.apache.carbondata.core.constants.CarbonCommonConstants
 import org.apache.carbondata.core.locks.{CarbonLockUtil, ICarbonLock, LockUsage}
 import org.apache.carbondata.core.metadata.converter.ThriftWrapperSchemaConverterImpl
+import org.apache.carbondata.core.metadata.schema.datamap.DataMapProperty
 import org.apache.carbondata.core.metadata.schema.table.{AggregationDataMapSchema, CarbonTable, DataMapSchema, TableSchema}
 import org.apache.carbondata.core.metadata.schema.table.column.ColumnSchema
 import org.apache.carbondata.core.util.CarbonUtil
@@ -353,7 +354,13 @@ object PreAggregateUtil {
         !expression.isInstanceOf[AttributeReference]) {
       newColumnName
     } else {
-      expression.asInstanceOf[AttributeReference].name
+      if (expression.isInstanceOf[GetStructField] || expression.isInstanceOf[GetArrayItem]) {
+        throw new UnsupportedOperationException(
+          "Preaggregate is unsupported for ComplexData type column: " +
+          expression.simpleString.replaceAll("#[0-9]*", ""))
+      } else {
+        expression.asInstanceOf[AttributeReference].name
+      }
     }
     createField(columnName,
       dataType,
@@ -757,7 +764,7 @@ object PreAggregateUtil {
           aggExp.isDistinct))
       case Sum(_: Expression) =>
         Seq(aggExp)
-      case Count(MatchCastExpression(exp: Seq[Expression], changeDataType: DataType)) =>
+      case Count(MatchCastExpression(exp: Seq[_], changeDataType: DataType)) =>
         Seq(AggregateExpression(Count(Cast(
           exp,
           changeDataType)),
@@ -869,7 +876,7 @@ object PreAggregateUtil {
   def getChildQuery(aggDataMapSchema: AggregationDataMapSchema): String = {
     new String(
       CarbonUtil.decodeStringToBytes(
-        aggDataMapSchema.getProperties.get("CHILD_SELECT QUERY").replace("&", "=")),
+        aggDataMapSchema.getProperties.get(DataMapProperty.CHILD_SELECT_QUERY).replace("&", "=")),
       CarbonCommonConstants.DEFAULT_CHARSET)
   }
 

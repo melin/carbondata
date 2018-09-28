@@ -25,13 +25,16 @@ import java.util.concurrent.Executors
 
 import scala.collection.mutable
 
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.hive.CarbonRelation
-import org.apache.spark.sql.{CarbonEnv, Row, SaveMode, SparkSession}
 import org.apache.spark.sql.streaming.{ProcessingTime, StreamingQuery}
 import org.apache.spark.sql.test.util.QueryTest
 import org.scalatest.BeforeAndAfterAll
 
+import org.apache.carbondata.common.exceptions.NoSuchStreamException
 import org.apache.carbondata.common.exceptions.sql.MalformedCarbonCommandException
 import org.apache.carbondata.core.constants.CarbonCommonConstants
 import org.apache.carbondata.core.metadata.schema.datamap.DataMapClassProvider.TIMESERIES
@@ -40,13 +43,20 @@ import org.apache.carbondata.core.statusmanager.{FileFormat, SegmentStatus}
 import org.apache.carbondata.core.util.CarbonProperties
 import org.apache.carbondata.core.util.path.CarbonTablePath
 import org.apache.carbondata.spark.exception.ProcessMetaDataException
+import org.apache.carbondata.spark.rdd.CarbonScanRDD
+import org.apache.carbondata.streaming.parser.CarbonStreamParser
 
 class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
   private val spark = sqlContext.sparkSession
   private val dataFilePath = s"$resourcesPath/streamSample.csv"
+  def currentPath: String = new File(this.getClass.getResource("/").getPath + "../../")
+    .getCanonicalPath
+  val badRecordFilePath: File =new File(currentPath + "/target/test/badRecords")
 
   override def beforeAll {
+    badRecordFilePath.delete()
+    badRecordFilePath.mkdirs()
     CarbonProperties.getInstance().addProperty(
       CarbonCommonConstants.CARBON_TIMESTAMP_FORMAT,
       CarbonCommonConstants.CARBON_TIMESTAMP_DEFAULT_FORMAT)
@@ -115,7 +125,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
     createTable(tableName = "agg_table", streaming = true, withBatchLoad = false)
 
-    val csvDataDir = new File("target/csvdatanew").getCanonicalPath
+    var csvDataDir = integrationPath + "/spark2/target/csvdatanew"
     generateCSVDataFile(spark, idStart = 10, rowNums = 5, csvDataDir)
     generateCSVDataFile(spark, idStart = 10, rowNums = 5, csvDataDir, SaveMode.Append)
   }
@@ -151,10 +161,10 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
   test("test blocking update and delete operation on streaming table") {
     val exceptionMsgUpdate = intercept[MalformedCarbonCommandException] {
-      sql("""UPDATE source d SET (d.c2) = (d.c2 + 1) WHERE d.c1 = 'a'""").show()
+      sql("""UPDATE source d SET (d.c2) = (d.c2 + 1) WHERE d.c1 = 'a'""").collect()
     }
     val exceptionMsgDelete = intercept[MalformedCarbonCommandException] {
-      sql("""DELETE FROM source WHERE d.c1 = 'a'""").show()
+      sql("""DELETE FROM source WHERE d.c1 = 'a'""").collect()
     }
     assert(exceptionMsgUpdate.getMessage.equals("Data update is not allowed for streaming table"))
     assert(exceptionMsgDelete.getMessage.equals("Data delete is not allowed for streaming table"))
@@ -162,16 +172,16 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
   test("test blocking alter table operation on streaming table") {
     val addColException = intercept[MalformedCarbonCommandException] {
-      sql("""ALTER TABLE source ADD COLUMNS (c6 string)""").show()
+      sql("""ALTER TABLE source ADD COLUMNS (c6 string)""").collect()
     }
     val dropColException = intercept[MalformedCarbonCommandException] {
-      sql("""ALTER TABLE source DROP COLUMNS (c1)""").show()
+      sql("""ALTER TABLE source DROP COLUMNS (c1)""").collect()
     }
     val renameException = intercept[MalformedCarbonCommandException] {
-      sql("""ALTER TABLE source RENAME to t""").show()
+      sql("""ALTER TABLE source RENAME to t""").collect()
     }
     val changeDataTypeException = intercept[MalformedCarbonCommandException] {
-      sql("""ALTER TABLE source CHANGE c2 c2 bigint""").show()
+      sql("""ALTER TABLE source CHANGE c2 c2 bigint""").collect()
     }
     assertResult("Alter table add column is not allowed for streaming table")(addColException.getMessage)
     assertResult("Alter table drop column is not allowed for streaming table")(dropColException.getMessage)
@@ -183,6 +193,11 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
     dropTable()
     sql("USE default")
     sql("DROP DATABASE IF EXISTS streaming CASCADE")
+    var csvDataDir = integrationPath + "/spark2/target/csvdatanew"
+    badRecordFilePath.delete()
+    new File(csvDataDir).delete()
+    csvDataDir = integrationPath + "/spark2/target/csvdata"
+    new File(csvDataDir).delete()
   }
 
   def dropTable(): Unit = {
@@ -357,12 +372,12 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
     sql("alter table agg_table2 compact 'streaming'")
     // Data should be loaded into aggregate table as hand-off is fired
     checkAnswer(sql("select name, sum(salary) from agg_table2 group by name"),
-        Seq(
-          Row("name_10", 400000.0),
-          Row("name_14", 560000.0),
-          Row("name_12", 480000.0),
-          Row("name_11", 440000.0),
-          Row("name_13", 520000.0)))
+      Seq(
+        Row("name_10", 400000.0),
+        Row("name_14", 560000.0),
+        Row("name_12", 480000.0),
+        Row("name_11", 440000.0),
+        Row("name_13", 520000.0)))
     checkAnswer(sql("select * from agg_table2_p1"),
       Seq(
         Row("name_10", 200000.0),
@@ -404,7 +419,6 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
         Row("name_12", 480000.0),
         Row("name_11", 440000.0),
         Row("name_13", 520000.0)))
-    //    sql("select * from agg_table2_p1").show()
     checkAnswer(sql("select * from agg_table2_p1"),
       Seq(
         Row("name_10", 200000.0),
@@ -639,10 +653,13 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
     )
     val result = sql("select count(*) from streaming.stream_table_1s").collect()
     // 20 seconds can't ingest all data, exists data delay
-    assert(result(0).getLong(0) > 5)
+    assert(result(0).getLong(0) >= 5)
   }
 
   test("query on stream table with dictionary, sort_columns") {
+    val batchParts =
+      partitionNums("select * from streaming.stream_table_filter")
+
     executeStreamingIngest(
       tableName = "stream_table_filter",
       batchNums = 2,
@@ -654,6 +671,12 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
       badRecordAction = "force",
       autoHandoff = false
     )
+
+    val totalParts =
+      partitionNums("select * from streaming.stream_table_filter")
+    assert(totalParts > batchParts)
+
+    val streamParts = totalParts - batchParts
 
     // non-filter
     val result = sql("select * from streaming.stream_table_filter order by id, name").collect()
@@ -667,63 +690,79 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
     assert(result(50).getString(1) == "batch_1")
 
     // filter
+    assert(batchParts >= partitionNums("select * from stream_table_filter where id >= 100000001"))
+
     checkAnswer(
       sql("select * from stream_table_filter where id = 1"),
       Seq(Row(1, "name_1", "city_1", 10000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where id = 1"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id > 49 and id < 100000002"),
       Seq(Row(50, "name_50", "city_50", 500000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0")),
         Row(100000001, "batch_1", "city_1", 0.1, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where id > 49 and id < 100000002"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id between 50 and 100000001"),
       Seq(Row(50, "name_50", "city_50", 500000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0")),
         Row(100000001, "batch_1", "city_1", 0.1, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where id between 50 and 100000001"))
 
     checkAnswer(
       sql("select * from stream_table_filter where name in ('name_9','name_10', 'name_11', 'name_12') and id <> 10 and id not in (11, 12)"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where name in ('name_9','name_10', 'name_11', 'name_12') and id <> 10 and id not in (11, 12)"))
 
     checkAnswer(
       sql("select * from stream_table_filter where name = 'name_3'"),
       Seq(Row(3, "name_3", "city_3", 30000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where name = 'name_3'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where name like '%me_3%' and id < 30"),
       Seq(Row(3, "name_3", "city_3", 30000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where name like '%me_3%' and id < 30"))
 
     checkAnswer(sql("select count(*) from stream_table_filter where name like '%ame%'"),
       Seq(Row(49)))
+    assert(totalParts == partitionNums("select count(*) from stream_table_filter where name like '%ame%'"))
 
     checkAnswer(sql("select count(*) from stream_table_filter where name like '%batch%'"),
       Seq(Row(5)))
+    assert(totalParts == partitionNums("select count(*) from stream_table_filter where name like '%batch%'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where name >= 'name_3' and id < 4"),
       Seq(Row(3, "name_3", "city_3", 30000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where name >= 'name_3' and id < 4"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id in (9, 10, 11, 12) and name <> 'name_10' and name not in ('name_11', 'name_12')"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where id in (9, 10, 11, 12) and name <> 'name_10' and name not in ('name_11', 'name_12')"))
 
     checkAnswer(
       sql("select * from stream_table_filter where city = 'city_1'"),
       Seq(Row(1, "name_1", "city_1", 10000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0")),
         Row(100000001, "batch_1", "city_1", 0.1, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where city = 'city_1'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where city like '%ty_1%' and ( id < 10 or id >= 100000001)"),
       Seq(Row(1, "name_1", "city_1", 10000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0")),
         Row(100000001, "batch_1", "city_1", 0.1, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where city like '%ty_1%' and ( id < 10 or id >= 100000001)"))
 
     checkAnswer(sql("select count(*) from stream_table_filter where city like '%city%'"),
       Seq(Row(54)))
+    assert(totalParts == partitionNums("select count(*) from stream_table_filter where city like '%city%'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where city > 'city_09' and city < 'city_10'"),
       Seq(Row(1, "name_1", "city_1", 10000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0")),
         Row(100000001, "batch_1", "city_1", 0.1, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where city > 'city_09' and city < 'city_10'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where city between 'city_09' and 'city_1'"),
@@ -733,204 +772,252 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
     checkAnswer(
       sql("select * from stream_table_filter where id in (9, 10, 11, 12) and city <> 'city_10' and city not in ('city_11', 'city_12')"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where id in (9, 10, 11, 12) and city <> 'city_10' and city not in ('city_11', 'city_12')"))
 
     checkAnswer(
       sql("select * from stream_table_filter where salary = 90000"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where salary = 90000"))
 
     checkAnswer(
       sql("select * from stream_table_filter where salary > 80000 and salary <= 100000"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(10, "name_10", "city_10", 100000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where salary > 80000 and salary <= 100000"))
 
     checkAnswer(
       sql("select * from stream_table_filter where salary between 80001 and 90000"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where salary between 80001 and 90000"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id in (9, 10, 11, 12) and salary <> 100000.0 and salary not in (110000.0, 120000.0)"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where id in (9, 10, 11, 12) and salary <> 100000.0 and salary not in (110000.0, 120000.0)"))
 
     checkAnswer(
       sql("select * from stream_table_filter where tax = 0.04 and id < 100"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where tax = 0.04 and id < 100"))
 
     checkAnswer(
       sql("select * from stream_table_filter where tax >= 0.04 and id < 100"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where tax >= 0.04 and id < 100"))
 
     checkAnswer(
       sql("select * from stream_table_filter where tax < 0.05 and tax > 0.02 and id < 100"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where tax < 0.05 and tax > 0.02 and id < 100"))
 
     checkAnswer(
       sql("select * from stream_table_filter where tax between 0.02 and 0.04 and id < 100"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where tax between 0.02 and 0.04 and id < 100"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id in (9, 10) and tax <> 0.01"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where id in (9, 10) and tax <> 0.01"))
 
     checkAnswer(
       sql("select * from stream_table_filter where percent = 80.04 and id < 100"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where percent = 80.04 and id < 100"))
 
     checkAnswer(
       sql("select * from stream_table_filter where percent >= 80.04 and id < 100"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where percent >= 80.04 and id < 100"))
 
     checkAnswer(
       sql("select * from stream_table_filter where percent < 80.05 and percent > 80.02 and id < 100"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where percent < 80.05 and percent > 80.02 and id < 100"))
 
     checkAnswer(
       sql("select * from stream_table_filter where percent between 80.02 and 80.05 and id < 100"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where percent between 80.02 and 80.05 and id < 100"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id in (9, 10) and percent <> 80.01"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where id in (9, 10) and percent <> 80.01"))
 
     checkAnswer(
       sql("select * from stream_table_filter where birthday between '1990-01-04' and '1990-01-05'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000004, "batch_4", "city_4", 0.4, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000005, "batch_5", "city_5", 0.5, BigDecimal.valueOf(0.05), 80.05, Date.valueOf("1990-01-05"), Timestamp.valueOf("2010-01-05 10:01:01.0"), Timestamp.valueOf("2010-01-05 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where birthday between '1990-01-04' and '1990-01-05'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where birthday = '1990-01-04'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000004, "batch_4", "city_4", 0.4, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where birthday = '1990-01-04'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where birthday > '1990-01-03' and birthday <= '1990-01-04'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000004, "batch_4", "city_4", 0.4, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where birthday > '1990-01-03' and birthday <= '1990-01-04'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where birthday between '1990-01-04' and '1990-01-05'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000004, "batch_4", "city_4", 0.4, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000005, "batch_5", "city_5", 0.5, BigDecimal.valueOf(0.05), 80.05, Date.valueOf("1990-01-05"), Timestamp.valueOf("2010-01-05 10:01:01.0"), Timestamp.valueOf("2010-01-05 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where birthday between '1990-01-04' and '1990-01-05'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id in (9, 10) and birthday <> '1990-01-01'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where id in (9, 10) and birthday <> '1990-01-01'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where register = '2010-01-04 10:01:01'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000004, "batch_4", "city_4", 0.4, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where register = '2010-01-04 10:01:01'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where register > '2010-01-03 10:01:01' and register <= '2010-01-04 10:01:01'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000004, "batch_4", "city_4", 0.4, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where register > '2010-01-03 10:01:01' and register <= '2010-01-04 10:01:01'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where register between '2010-01-04 10:01:01' and '2010-01-05 10:01:01'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000004, "batch_4", "city_4", 0.4, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000005, "batch_5", "city_5", 0.5, BigDecimal.valueOf(0.05), 80.05, Date.valueOf("1990-01-05"), Timestamp.valueOf("2010-01-05 10:01:01.0"), Timestamp.valueOf("2010-01-05 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where register between '2010-01-04 10:01:01' and '2010-01-05 10:01:01'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id in (9, 10) and register <> '2010-01-01 10:01:01'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where id in (9, 10) and register <> '2010-01-01 10:01:01'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where updated = '2010-01-04 10:01:01'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000004, "batch_4", "city_4", 0.4, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where updated = '2010-01-04 10:01:01'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where updated > '2010-01-03 10:01:01' and register <= '2010-01-04 10:01:01'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000004, "batch_4", "city_4", 0.4, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where updated > '2010-01-03 10:01:01' and register <= '2010-01-04 10:01:01'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where updated between '2010-01-04 10:01:01' and '2010-01-05 10:01:01'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000004, "batch_4", "city_4", 0.4, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0")),
         Row(100000005, "batch_5", "city_5", 0.5, BigDecimal.valueOf(0.05), 80.05, Date.valueOf("1990-01-05"), Timestamp.valueOf("2010-01-05 10:01:01.0"), Timestamp.valueOf("2010-01-05 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where updated between '2010-01-04 10:01:01' and '2010-01-05 10:01:01'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id in (9, 10) and updated <> '2010-01-01 10:01:01'"),
       Seq(Row(9, "name_9", "city_9", 90000.0, BigDecimal.valueOf(0.04), 80.04, Date.valueOf("1990-01-04"), Timestamp.valueOf("2010-01-04 10:01:01.0"), Timestamp.valueOf("2010-01-04 10:01:01.0"))))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where id in (9, 10) and updated <> '2010-01-01 10:01:01'"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id is null order by name"),
       Seq(Row(null, "", "", null, null, null, null, null, null),
         Row(null, "name_6", "city_6", 60000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts >= partitionNums("select * from stream_table_filter where id is null order by name"))
 
     checkAnswer(
       sql("select * from stream_table_filter where name = ''"),
       Seq(Row(null, "", "", null, null, null, null, null, null)))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where name = ''"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id is null and name <> ''"),
       Seq(Row(null, "name_6", "city_6", 60000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts == partitionNums("select * from stream_table_filter where id is null and name <> ''"))
 
     checkAnswer(
       sql("select * from stream_table_filter where city = ''"),
       Seq(Row(null, "", "", null, null, null, null, null, null)))
+    assert(streamParts >= partitionNums("select * from stream_table_filter where city = ''"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id is null and city <> ''"),
       Seq(Row(null, "name_6", "city_6", 60000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts == partitionNums("select * from stream_table_filter where id is null and city <> ''"))
 
     checkAnswer(
       sql("select * from stream_table_filter where salary is null"),
       Seq(Row(null, "", "", null, null, null, null, null, null)))
+    assert(totalParts == partitionNums("select * from stream_table_filter where salary is null"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id is null and salary is not null"),
       Seq(Row(null, "name_6", "city_6", 60000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts == partitionNums("select * from stream_table_filter where id is null and salary is not null"))
 
     checkAnswer(
       sql("select * from stream_table_filter where tax is null"),
       Seq(Row(null, "", "", null, null, null, null, null, null)))
+    assert(totalParts == partitionNums("select * from stream_table_filter where tax is null"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id is null and tax is not null"),
       Seq(Row(null, "name_6", "city_6", 60000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts == partitionNums("select * from stream_table_filter where id is null and tax is not null"))
 
     checkAnswer(
       sql("select * from stream_table_filter where percent is null"),
       Seq(Row(null, "", "", null, null, null, null, null, null)))
+    assert(totalParts == partitionNums("select * from stream_table_filter where percent is null"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id is null and percent is not null"),
       Seq(Row(null, "name_6", "city_6", 60000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts == partitionNums("select * from stream_table_filter where id is null and percent is not null"))
 
     checkAnswer(
       sql("select * from stream_table_filter where birthday is null"),
       Seq(Row(null, "", "", null, null, null, null, null, null)))
+    assert(1 == partitionNums("select * from stream_table_filter where birthday is null"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id is null and birthday is not null"),
       Seq(Row(null, "name_6", "city_6", 60000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts == partitionNums("select * from stream_table_filter where id is null and birthday is not null"))
 
     checkAnswer(
       sql("select * from stream_table_filter where register is null"),
       Seq(Row(null, "", "", null, null, null, null, null, null)))
+    assert(1 == partitionNums("select * from stream_table_filter where register is null"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id is null and register is not null"),
       Seq(Row(null, "name_6", "city_6", 60000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts == partitionNums("select * from stream_table_filter where id is null and register is not null"))
 
     checkAnswer(
       sql("select * from stream_table_filter where updated is null"),
       Seq(Row(null, "", "", null, null, null, null, null, null)))
+    assert(3 == partitionNums("select * from stream_table_filter where updated is null"))
 
     checkAnswer(
       sql("select * from stream_table_filter where id is null and updated is not null"),
       Seq(Row(null, "name_6", "city_6", 60000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))))
+    assert(totalParts == partitionNums("select * from stream_table_filter where id is null and updated is not null"))
 
     // agg
     checkAnswer(
       sql("select count(*), max(id), min(name), cast(avg(id) as integer), sum(id) " +
           "from stream_table_filter where id >= 2 and id <= 100000004"),
       Seq(Row(51, 100000004, "batch_1", 7843162, 400001276)))
+    assert(totalParts >= partitionNums(
+      "select count(*), max(id), min(name), cast(avg(id) as integer), sum(id) " +
+      "from stream_table_filter where id >= 2 and id <= 100000004"))
 
     checkAnswer(
       sql("select city, count(id), sum(id), cast(avg(id) as integer), " +
@@ -943,6 +1030,14 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
       Seq(Row("city_1", 2, 100000002, 50000001, 10000.0, 0.1),
         Row("city_2", 1, 100000002, 100000002, 0.2, 0.2),
         Row("city_3", 2, 100000006, 50000003, 30000.0, 0.3)))
+    assert(totalParts >= partitionNums(
+      "select city, count(id), sum(id), cast(avg(id) as integer), " +
+      "max(salary), min(salary) " +
+      "from stream_table_filter " +
+      "where name in ('batch_1', 'batch_2', 'batch_3', 'name_1', 'name_2', 'name_3') " +
+      "and city <> '' " +
+      "group by city " +
+      "order by city"))
 
     // batch loading
     for(_ <- 0 to 2) {
@@ -1153,12 +1248,12 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where id is null order by name"),
-      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null, null)), null)),
+      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null)), null)),
         Row(null, "name_6", "city_6", 60000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Row(wrap(Array("school_6", "school_66")), 6))))
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where name = ''"),
-      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null, null)), null))))
+      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null)), null))))
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where id is null and name <> ''"),
@@ -1166,7 +1261,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where city = ''"),
-      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null, null)), null))))
+      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null)), null))))
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where id is null and city <> ''"),
@@ -1174,7 +1269,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where salary is null"),
-      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null, null)), null))))
+      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null)), null))))
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where id is null and salary is not null"),
@@ -1182,7 +1277,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where tax is null"),
-      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null, null)), null))))
+      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null)), null))))
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where id is null and tax is not null"),
@@ -1190,7 +1285,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where percent is null"),
-      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null, null)), null))))
+      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null)), null))))
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where id is null and salary is not null"),
@@ -1198,7 +1293,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where birthday is null"),
-      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null, null)), null))))
+      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null)), null))))
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where id is null and birthday is not null"),
@@ -1206,7 +1301,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where register is null"),
-      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null, null)), null))))
+      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null)), null))))
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where id is null and register is not null"),
@@ -1214,7 +1309,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where updated is null"),
-      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null, null)), null))))
+      Seq(Row(null, "", "", null, null, null, null, null, null, Row(wrap(Array(null)), null))))
 
     checkAnswer(
       sql("select * from stream_table_filter_complex where id is null and updated is not null"),
@@ -1296,7 +1391,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
       sql("ALTER TABLE streaming.stream_table_handoff UNSET TBLPROPERTIES IF EXISTS ('streaming')")
       assert(false, "unsupport to unset streaming property")
     } catch {
-      case _ =>
+      case _: Throwable =>
         assert(true)
     }
     try {
@@ -1314,7 +1409,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
         autoHandoff = false
       )
     } catch {
-      case _ =>
+      case _: Throwable =>
         assert(false, "should support set table to streaming")
     }
 
@@ -1411,6 +1506,9 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
   }
 
   test("auto hand off, close and reopen streaming table") {
+    sql("alter table streaming.stream_table_reopen compact 'close_streaming'")
+    sql("ALTER TABLE streaming.stream_table_reopen SET TBLPROPERTIES('streaming'='true')")
+
     executeStreamingIngest(
       tableName = "stream_table_reopen",
       batchNums = 2,
@@ -1425,7 +1523,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
     )
     val table1 =
       CarbonEnv.getCarbonTable(Option("streaming"), "stream_table_reopen")(spark)
-    assertResult(true)(table1.isStreamingTable)
+    assertResult(true)(table1.isStreamingSink)
 
     sql("alter table streaming.stream_table_reopen compact 'close_streaming'")
 
@@ -1442,13 +1540,13 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
 
     val table2 =
       CarbonEnv.getCarbonTable(Option("streaming"), "stream_table_reopen")(spark)
-    assertResult(false)(table2.isStreamingTable)
+    assertResult(false)(table2.isStreamingSink)
 
     sql("ALTER TABLE streaming.stream_table_reopen SET TBLPROPERTIES('streaming'='true')")
 
     val table3 =
       CarbonEnv.getCarbonTable(Option("streaming"), "stream_table_reopen")(spark)
-    assertResult(true)(table3.isStreamingTable)
+    assertResult(true)(table3.isStreamingSink)
 
     executeStreamingIngest(
       tableName = "stream_table_reopen",
@@ -1562,6 +1660,599 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
     assertResult("true")(resultStreaming(0).getString(1).trim)
   }
 
+
+  test("test bad_record_action IGNORE on streaming table") {
+    sql("drop table if exists streaming.bad_record_ignore")
+    sql(
+      s"""
+         | CREATE TABLE streaming.bad_record_ignore(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT
+         | )
+         | STORED BY 'carbondata'
+         | TBLPROPERTIES('streaming'='true')
+         | """.stripMargin)
+
+    executeStreamingIngest(
+      tableName = "bad_record_ignore",
+      batchNums = 2,
+      rowNumsEachBatch = 10,
+      intervalOfSource = 1,
+      intervalOfIngest = 1,
+      continueSeconds = 8,
+      generateBadRecords = true,
+      badRecordAction = "ignore",
+      autoHandoff = false
+    )
+
+    checkAnswer(sql("select count(*) from streaming.bad_record_ignore"), Seq(Row(19)))
+  }
+
+  test("test bad_record_action REDIRECT on streaming table") {
+    sql("drop table if exists streaming.bad_record_redirect")
+    sql(
+      s"""
+         | CREATE TABLE streaming.bad_record_redirect(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT
+         | )
+         | STORED BY 'carbondata'
+         | TBLPROPERTIES('streaming'='true')
+         | """.stripMargin)
+
+    executeStreamingIngest(
+      tableName = "bad_record_redirect",
+      batchNums = 2,
+      rowNumsEachBatch = 10,
+      intervalOfSource = 1,
+      intervalOfIngest = 1,
+      continueSeconds = 8,
+      generateBadRecords = true,
+      badRecordAction = "redirect",
+      autoHandoff = false,
+      badRecordsPath = badRecordFilePath.getCanonicalPath)
+    assert(new File(badRecordFilePath.getCanonicalFile + "/streaming/bad_record_redirect").isDirectory)
+    checkAnswer(sql("select count(*) from streaming.bad_record_redirect"), Seq(Row(19)))
+  }
+
+  test("StreamSQL: create and drop a stream") {
+    sql("DROP TABLE IF EXISTS source")
+    sql("DROP TABLE IF EXISTS sink")
+
+    var rows = sql("SHOW STREAMS").collect()
+    assertResult(0)(rows.length)
+
+    val csvDataDir = integrationPath + "/spark2/target/streamSql"
+    // streaming ingest 10 rows
+    generateCSVDataFile(spark, idStart = 10, rowNums = 10, csvDataDir)
+
+    sql(
+      s"""
+         |CREATE TABLE source(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         |)
+         |STORED AS carbondata
+         |TBLPROPERTIES (
+         | 'streaming'='source',
+         | 'format'='csv',
+         | 'path'='$csvDataDir'
+         |)
+      """.stripMargin)
+
+    sql(
+      s"""
+         |CREATE TABLE sink(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         | )
+         |STORED AS carbondata
+         |TBLPROPERTIES('streaming'='sink')
+      """.stripMargin)
+
+    sql(
+      """
+        |CREATE STREAM stream123 ON TABLE sink
+        |STMPROPERTIES(
+        |  'trigger'='ProcessingTime',
+        |  'interval'='5 seconds')
+        |AS
+        |  SELECT *
+        |  FROM source
+        |  WHERE id % 2 = 1
+      """.stripMargin).show(false)
+
+    Thread.sleep(200)
+    sql("select * from sink").show
+
+    generateCSVDataFile(spark, idStart = 30, rowNums = 10, csvDataDir, SaveMode.Append)
+    Thread.sleep(7000)
+
+    // after 2 minibatch, there should be 10 row added (filter condition: id%2=1)
+    checkAnswer(sql("select count(*) from sink"), Seq(Row(10)))
+
+    val row = sql("select * from sink order by id").head()
+    val exceptedRow = Row(11, "name_11", "city_11", 110000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))
+    assertResult(exceptedRow)(row)
+
+    sql("SHOW STREAMS").show(false)
+
+    rows = sql("SHOW STREAMS").collect()
+    assertResult(1)(rows.length)
+    assertResult("stream123")(rows.head.getString(0))
+    assertResult("RUNNING")(rows.head.getString(2))
+    assertResult("streaming.source")(rows.head.getString(3))
+    assertResult("streaming.sink")(rows.head.getString(4))
+
+    rows = sql("SHOW STREAMS ON TABLE sink").collect()
+    assertResult(1)(rows.length)
+    assertResult("stream123")(rows.head.getString(0))
+    assertResult("RUNNING")(rows.head.getString(2))
+    assertResult("streaming.source")(rows.head.getString(3))
+    assertResult("streaming.sink")(rows.head.getString(4))
+
+    sql("DROP STREAM stream123")
+    sql("DROP STREAM IF EXISTS stream123")
+
+    rows = sql("SHOW STREAMS").collect()
+    assertResult(0)(rows.length)
+
+    sql("DROP TABLE IF EXISTS source")
+    sql("DROP TABLE IF EXISTS sink")
+  }
+
+  test("StreamSQL: create and drop a stream with Load options") {
+    sql("DROP TABLE IF EXISTS source")
+    sql("DROP TABLE IF EXISTS sink")
+
+    var rows = sql("SHOW STREAMS").collect()
+    assertResult(0)(rows.length)
+
+    val csvDataDir = integrationPath + "/spark2/target/streamSql"
+    // streaming ingest 10 rows
+    generateCSVDataFile(spark, idStart = 10, rowNums = 10, csvDataDir)
+
+    sql(
+      s"""
+         |CREATE TABLE source(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         |)
+         |STORED AS carbondata
+         |TBLPROPERTIES (
+         | 'streaming'='source',
+         | 'format'='csv',
+         | 'path'='$csvDataDir'
+         |)
+      """.stripMargin)
+
+    sql(
+      s"""
+         |CREATE TABLE sink(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         | )
+         |STORED AS carbondata
+         |TBLPROPERTIES('streaming'='sink')
+      """.stripMargin)
+
+    sql(
+      s"""
+        |CREATE STREAM stream123 ON TABLE sink
+        |STMPROPERTIES(
+        |  'trigger'='ProcessingTime',
+        |  'interval'='1 seconds',
+        |  'BAD_RECORDS_LOGGER_ENABLE' = 'FALSE',
+        |  'BAD_RECORDS_ACTION' = 'FORCE',
+        |  'BAD_RECORDS_PATH'='$warehouse')
+        |AS
+        |  SELECT *
+        |  FROM source
+        |  WHERE id % 2 = 1
+      """.stripMargin).show(false)
+    sql(
+      s"""
+        |CREATE STREAM IF NOT EXISTS stream123 ON TABLE sink
+        |STMPROPERTIES(
+        |  'trigger'='ProcessingTime',
+        |  'interval'='1 seconds',
+        |  'BAD_RECORDS_LOGGER_ENABLE' = 'FALSE',
+        |  'BAD_RECORDS_ACTION' = 'FORCE',
+        |  'BAD_RECORDS_PATH'='$warehouse')
+        |AS
+        |  SELECT *
+        |  FROM source
+        |  WHERE id % 2 = 1
+      """.stripMargin).show(false)
+    Thread.sleep(200)
+    sql("select * from sink").show
+
+    generateCSVDataFile(spark, idStart = 30, rowNums = 10, csvDataDir, SaveMode.Append)
+    Thread.sleep(5000)
+
+    // after 2 minibatch, there should be 10 row added (filter condition: id%2=1)
+    checkAnswer(sql("select count(*) from sink"), Seq(Row(10)))
+
+    val row = sql("select * from sink order by id").head()
+    val exceptedRow = Row(11, "name_11", "city_11", 110000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))
+    assertResult(exceptedRow)(row)
+
+    sql("SHOW STREAMS").show(false)
+
+    rows = sql("SHOW STREAMS").collect()
+    assertResult(1)(rows.length)
+    assertResult("stream123")(rows.head.getString(0))
+    assertResult("RUNNING")(rows.head.getString(2))
+    assertResult("streaming.source")(rows.head.getString(3))
+    assertResult("streaming.sink")(rows.head.getString(4))
+
+    rows = sql("SHOW STREAMS ON TABLE sink").collect()
+    assertResult(1)(rows.length)
+    assertResult("stream123")(rows.head.getString(0))
+    assertResult("RUNNING")(rows.head.getString(2))
+    assertResult("streaming.source")(rows.head.getString(3))
+    assertResult("streaming.sink")(rows.head.getString(4))
+
+    sql("DROP STREAM stream123")
+    sql("DROP STREAM IF EXISTS stream123")
+
+    rows = sql("SHOW STREAMS").collect()
+    assertResult(0)(rows.length)
+
+    sql("DROP TABLE IF EXISTS source")
+    sql("DROP TABLE IF EXISTS sink")
+  }
+
+  test("StreamSQL: create stream without interval ") {
+    sql("DROP TABLE IF EXISTS source")
+    sql("DROP TABLE IF EXISTS sink")
+
+    val csvDataDir = integrationPath + "/spark2/target/streamsql"
+    // streaming ingest 10 rows
+    generateCSVDataFile(spark, idStart = 10, rowNums = 10, csvDataDir)
+
+    sql(
+      s"""
+         |CREATE TABLE source(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         |)
+         |STORED AS carbondata
+         |TBLPROPERTIES (
+         | 'streaming'='source',
+         | 'format'='csv',
+         | 'path'='$csvDataDir'
+         |)
+      """.stripMargin)
+    sql(
+      s"""
+         |CREATE TABLE sink(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         | )
+         |STORED AS carbondata
+         |TBLPROPERTIES('streaming'='sink')
+      """.stripMargin)
+    val ex = intercept[MalformedCarbonCommandException] {
+      sql(
+        """
+          |CREATE STREAM stream456 ON TABLE sink
+          |STMPROPERTIES(
+          |  'trigger'='ProcessingTime')
+          |AS
+          |  SELECT *
+          |  FROM source
+          |  WHERE id % 2 = 1
+        """.stripMargin)
+    }
+    assert(ex.getMessage.contains("interval must be specified"))
+    sql("DROP TABLE IF EXISTS source")
+    sql("DROP TABLE IF EXISTS sink")
+  }
+
+  test("StreamSQL: create stream on non exist stream source table") {
+    sql("DROP TABLE IF EXISTS sink")
+    sql(
+      s"""
+         |CREATE TABLE sink(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         | )
+         |STORED AS carbondata
+         |TBLPROPERTIES('streaming'='true')
+      """.stripMargin)
+
+    val ex = intercept[AnalysisException] {
+      sql(
+        """
+          |CREATE STREAM stream123 ON TABLE sink
+          |STMPROPERTIES(
+          |  'trigger'='ProcessingTime',
+          |  'interval'='1 seconds')
+          |AS
+          |  SELECT *
+          |  FROM source
+          |  WHERE id % 2 = 1
+        """.stripMargin).show(false)
+    }
+    sql("DROP TABLE IF EXISTS sink")
+  }
+
+  test("StreamSQL: create stream source using carbon file") {
+    sql("DROP TABLE IF EXISTS source")
+    sql("DROP TABLE IF EXISTS sink")
+
+    sql(
+      s"""
+         |CREATE TABLE source(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         |)
+         |STORED AS carbondata
+         |TBLPROPERTIES (
+         | 'streaming'='source'
+         |)
+      """.stripMargin)
+
+    sql(
+      s"""
+         |CREATE TABLE sink(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         | )
+         |STORED AS carbondata
+         |TBLPROPERTIES('streaming'='sink')
+      """.stripMargin)
+
+    val ex = intercept[MalformedCarbonCommandException] {
+      sql(
+        """
+          |CREATE STREAM stream123 ON TABLE sink
+          |STMPROPERTIES(
+          |  'trigger'='ProcessingTime',
+          |  'interval'='1 seconds')
+          |AS
+          |  SELECT *
+          |  FROM source
+          |  WHERE id % 2 = 1
+        """.stripMargin)
+    }
+    assert(ex.getMessage.contains("Streaming from carbon file is not supported"))
+
+    sql("DROP TABLE IF EXISTS source")
+    sql("DROP TABLE IF EXISTS sink")
+  }
+
+  test("StreamSQL: start stream on non-stream table") {
+    sql("DROP TABLE IF EXISTS source")
+    sql("DROP TABLE IF EXISTS sink")
+
+    sql(
+      s"""
+         |CREATE TABLE notsource(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         | )
+         |STORED AS carbondata
+      """.stripMargin)
+    sql(
+      s"""
+         |CREATE TABLE sink(
+         | id INT,
+         | name STRING,
+         | city STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         | )
+         |STORED AS carbondata
+         |TBLPROPERTIES('streaming'='true')
+      """.stripMargin)
+
+    val ex = intercept[MalformedCarbonCommandException] {
+      sql(
+        """
+          |CREATE STREAM stream456 ON TABLE sink
+          |STMPROPERTIES(
+          |  'trigger'='ProcessingTime',
+          |  'interval'='1 seconds')
+          |AS
+          |  SELECT *
+          |  FROM notsource
+          |  WHERE id % 2 = 1
+        """.stripMargin).show(false)
+    }
+    assert(ex.getMessage.contains("Must specify stream source table in the stream query"))
+    sql("DROP TABLE sink")
+  }
+
+  test("StreamSQL: drop stream on non exist table") {
+    val ex = intercept[NoSuchStreamException] {
+      sql("DROP STREAM streamyyy")
+    }
+    assert(ex.getMessage.contains("stream 'streamyyy' not found"))
+  }
+
+  test("StreamSQL: show streams on non-exist table") {
+    val ex = intercept[NoSuchTableException] {
+      sql("SHOW STREAMS ON TABLE ddd")
+    }
+    assert(ex.getMessage.contains("'ddd' not found"))
+  }
+
+  test("StreamSQL: stream join dimension table") {
+    sql("DROP TABLE IF EXISTS source")
+    sql("DROP TABLE IF EXISTS sink")
+    sql("DROP TABLE IF EXISTS dimension")
+
+    sql(
+      s"""
+         |CREATE TABLE dim(
+         |  id INT,
+         |  name STRING,
+         |  country STRING
+         |)
+         |STORED AS carbondata
+       """.stripMargin)
+    val inputDir = integrationPath + "/spark2/target/streamDim"
+    import spark.implicits._
+    spark.createDataset(Seq((1, "alice", "india"), (2, "bob", "france"), (3, "chris", "canada")))
+      .write.mode("overwrite").csv(inputDir)
+    sql(s"LOAD DATA INPATH '$inputDir' INTO TABLE dim OPTIONS('header'='false')")
+    sql("SELECT * FROM dim").show
+
+    var rows = sql("SHOW STREAMS").collect()
+    assertResult(0)(rows.length)
+
+    val csvDataDir = integrationPath + "/spark2/target/streamSql"
+    // streaming ingest 10 rows
+    generateCSVDataFile(spark, idStart = 10, rowNums = 10, csvDataDir, SaveMode.Overwrite, false)
+
+    sql(
+      s"""
+         |CREATE TABLE source(
+         | id INT,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         |)
+         |STORED AS carbondata
+         |TBLPROPERTIES (
+         | 'streaming'='source',
+         | 'format'='csv',
+         | 'path'='$csvDataDir'
+         |)
+      """.stripMargin)
+
+    sql(
+      s"""
+         |CREATE TABLE sink(
+         | id INT,
+         | name STRING,
+         | country STRING,
+         | salary FLOAT,
+         | tax DECIMAL(8,2),
+         | percent double,
+         | birthday DATE,
+         | register TIMESTAMP,
+         | updated TIMESTAMP
+         | )
+         |STORED AS carbondata
+         |TBLPROPERTIES('streaming'='sink')
+      """.stripMargin)
+
+    sql(
+      """
+        |CREATE STREAM stream123 ON TABLE sink
+        |STMPROPERTIES(
+        |  'trigger'='ProcessingTime',
+        |  'interval'='1 seconds')
+        |AS
+        |  SELECT s.id, d.name, d.country, s.salary, s.tax, s.percent, s.birthday, s.register, s.updated
+        |  FROM source s
+        |  JOIN dim d ON s.id = d.id
+      """.stripMargin).show(false)
+
+    Thread.sleep(2000)
+    sql("select * from sink").show
+
+    generateCSVDataFile(spark, idStart = 30, rowNums = 10, csvDataDir, SaveMode.Append, false)
+    Thread.sleep(5000)
+
+    // after 2 minibatch, there should be 10 row added (filter condition: id%2=1)
+    checkAnswer(sql("select count(*) from sink"), Seq(Row(20)))
+
+    sql("select * from sink order by id").show
+    val row = sql("select * from sink order by id, salary").head()
+    val exceptedRow = Row(1, "alice", "india", 120000.0, BigDecimal.valueOf(0.01), 80.01, Date.valueOf("1990-01-01"), Timestamp.valueOf("2010-01-01 10:01:01.0"), Timestamp.valueOf("2010-01-01 10:01:01.0"))
+    assertResult(exceptedRow)(row)
+
+    sql("DROP STREAM stream123")
+    sql("DROP TABLE IF EXISTS source")
+    sql("DROP TABLE IF EXISTS sink")
+    sql("DROP TABLE IF EXISTS dim")
+  }
+
   def createWriteSocketThread(
       serverSocket: ServerSocket,
       writeNums: Int,
@@ -1625,7 +2316,8 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
       badRecordAction: String = "force",
       intervalSecond: Int = 2,
       handoffSize: Long = CarbonCommonConstants.HANDOFF_SIZE_DEFAULT,
-      autoHandoff: Boolean = CarbonCommonConstants.ENABLE_AUTO_HANDOFF_DEFAULT.toBoolean
+      autoHandoff: Boolean = CarbonCommonConstants.ENABLE_AUTO_HANDOFF_DEFAULT.toBoolean,
+      badRecordsPath: String = CarbonCommonConstants.CARBON_BADRECORDS_LOC_DEFAULT_VAL
   ): Thread = {
     new Thread() {
       override def run(): Unit = {
@@ -1643,8 +2335,11 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
             .trigger(ProcessingTime(s"$intervalSecond seconds"))
             .option("checkpointLocation", CarbonTablePath.getStreamingCheckpointDir(carbonTable.getTablePath))
             .option("bad_records_action", badRecordAction)
+            .option("BAD_RECORD_PATH", badRecordsPath)
             .option("dbName", tableIdentifier.database.get)
             .option("tableName", tableIdentifier.table)
+            .option(CarbonStreamParser.CARBON_STREAM_PARSER,
+              CarbonStreamParser.CARBON_STREAM_PARSER_CSV)
             .option(CarbonCommonConstants.HANDOFF_SIZE, handoffSize)
             .option("timestampformat", CarbonCommonConstants.CARBON_TIMESTAMP_DEFAULT_FORMAT)
             .option(CarbonCommonConstants.ENABLE_AUTO_HANDOFF, autoHandoff)
@@ -1676,7 +2371,8 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
       generateBadRecords: Boolean,
       badRecordAction: String,
       handoffSize: Long = CarbonCommonConstants.HANDOFF_SIZE_DEFAULT,
-      autoHandoff: Boolean = CarbonCommonConstants.ENABLE_AUTO_HANDOFF_DEFAULT.toBoolean
+      autoHandoff: Boolean = CarbonCommonConstants.ENABLE_AUTO_HANDOFF_DEFAULT.toBoolean,
+      badRecordsPath: String = CarbonCommonConstants.CARBON_BADRECORDS_LOC_DEFAULT_VAL
   ): Unit = {
     val identifier = new TableIdentifier(tableName, Option("streaming"))
     val carbonTable = CarbonEnv.getInstance(spark).carbonMetastore.lookupRelation(identifier)(spark)
@@ -1698,7 +2394,8 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
         badRecordAction = badRecordAction,
         intervalSecond = intervalOfIngest,
         handoffSize = handoffSize,
-        autoHandoff = autoHandoff)
+        autoHandoff = autoHandoff,
+        badRecordsPath = badRecordsPath)
       thread1.start()
       thread2.start()
       Thread.sleep(continueSeconds * 1000)
@@ -1716,23 +2413,42 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
       idStart: Int,
       rowNums: Int,
       csvDirPath: String,
-      saveMode: SaveMode = SaveMode.Overwrite): Unit = {
+      saveMode: SaveMode = SaveMode.Overwrite,
+      withDim: Boolean = true): Unit = {
     // Create csv data frame file
-    val csvRDD = spark.sparkContext.parallelize(idStart until idStart + rowNums)
-      .map { id =>
-        (id,
-          "name_" + id,
-          "city_" + id,
-          10000.00 * id,
-          BigDecimal.valueOf(0.01),
-          80.01,
-          "1990-01-01",
-          "2010-01-01 10:01:01",
-          "2010-01-01 10:01:01",
-          "school_" + id + ":school_" + id + id + "$" + id)
-      }
-    val csvDataDF = spark.createDataFrame(csvRDD).toDF(
-      "id", "name", "city", "salary", "tax", "percent", "birthday", "register", "updated", "file")
+    val csvDataDF = if (withDim) {
+      // generate data with dimension columns (name and city)
+      val csvRDD = spark.sparkContext.parallelize(idStart until idStart + rowNums)
+        .map { id =>
+          (id,
+            "name_" + id,
+            "city_" + id,
+            10000.00 * id,
+            BigDecimal.valueOf(0.01),
+            80.01,
+            "1990-01-01",
+            "2010-01-01 10:01:01",
+            "2010-01-01 10:01:01",
+            "school_" + id + ":school_" + id + id + "$" + id)
+        }
+      spark.createDataFrame(csvRDD).toDF(
+        "id", "name", "city", "salary", "tax", "percent", "birthday", "register", "updated", "file")
+    } else {
+      // generate data without dimension columns
+      val csvRDD = spark.sparkContext.parallelize(idStart until idStart + rowNums)
+        .map { id =>
+          (id % 3 + 1,
+            10000.00 * id,
+            BigDecimal.valueOf(0.01),
+            80.01,
+            "1990-01-01",
+            "2010-01-01 10:01:01",
+            "2010-01-01 10:01:01",
+            "school_" + id + ":school_" + id + id + "$" + id)
+        }
+      spark.createDataFrame(csvRDD).toDF(
+        "id", "salary", "tax", "percent", "birthday", "register", "updated", "file")
+    }
 
     csvDataDF.write
       .option("header", "false")
@@ -1760,6 +2476,8 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
             .option("dbName", tableIdentifier.database.get)
             .option("tableName", tableIdentifier.table)
             .option("timestampformat", CarbonCommonConstants.CARBON_TIMESTAMP_DEFAULT_FORMAT)
+            .option(CarbonStreamParser.CARBON_STREAM_PARSER,
+              CarbonStreamParser.CARBON_STREAM_PARSER_CSV)
             .start()
 
           qry.awaitTermination()
@@ -1791,7 +2509,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
          | )
          | STORED BY 'carbondata'
          | TBLPROPERTIES(${if (streaming) "'streaming'='true', " else "" }
-         | 'sort_columns'='name', 'dictionary_include'='city,register')
+         | 'sort_columns'='name', 'dictionary_include'='city,register', 'BAD_RECORDS_PATH'='$badRecordFilePath')
          | """.stripMargin)
 
     if (withBatchLoad) {
@@ -1820,7 +2538,7 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
          | )
          | STORED BY 'carbondata'
          | TBLPROPERTIES(${if (streaming) "'streaming'='true', " else "" }
-         | 'sort_columns'='name', 'dictionary_include'='id,name,salary,tax,percent,updated')
+         | 'sort_columns'='name', 'dictionary_include'='id,name,salary,tax,percent,updated', 'BAD_RECORDS_PATH'='$badRecordFilePath')
          | """.stripMargin)
 
     if (withBatchLoad) {
@@ -1866,6 +2584,19 @@ class TestStreamingTableOperation extends QueryTest with BeforeAndAfterAll {
       }
     } while (retry)
     serverSocket
+  }
+
+  def findCarbonScanRDD(rdd: RDD[_]): RDD[_] = {
+    if (rdd.isInstanceOf[CarbonScanRDD[_]]) {
+      rdd
+    } else {
+      findCarbonScanRDD(rdd.dependencies(0).rdd)
+    }
+  }
+
+  def partitionNums(sqlString : String): Int = {
+    val rdd = findCarbonScanRDD(sql(sqlString).rdd)
+    rdd.partitions.length
   }
 
 }

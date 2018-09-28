@@ -33,7 +33,7 @@ import org.apache.carbondata.core.datamap.dev.cgdatamap.CoarseGrainDataMap;
 import org.apache.carbondata.core.datastore.block.SegmentProperties;
 import org.apache.carbondata.core.datastore.impl.FileFactory;
 import org.apache.carbondata.core.fileoperations.AtomicFileOperations;
-import org.apache.carbondata.core.fileoperations.AtomicFileOperationsImpl;
+import org.apache.carbondata.core.fileoperations.AtomicFileOperationFactory;
 import org.apache.carbondata.core.indexstore.Blocklet;
 import org.apache.carbondata.core.indexstore.PartitionSpec;
 import org.apache.carbondata.core.memory.MemoryException;
@@ -95,7 +95,7 @@ public class MinMaxIndexDataMap extends CoarseGrainDataMap {
     InputStreamReader inStream = null;
     MinMaxIndexBlockDetails[] readMinMax = null;
     AtomicFileOperations fileOperation =
-        new AtomicFileOperationsImpl(filePath, FileFactory.getFileType(filePath));
+        AtomicFileOperationFactory.getAtomicFileOperations(filePath);
 
     try {
       if (!FileFactory.isFileExist(filePath, FileFactory.getFileType(filePath))) {
@@ -140,7 +140,7 @@ public class MinMaxIndexDataMap extends CoarseGrainDataMap {
 
           BitSet bitSet = filterExecuter.isScanRequired(
               readMinMaxDataMap[blkIdx][blkltIdx].getMaxValues(),
-              readMinMaxDataMap[blkIdx][blkltIdx].getMinValues());
+              readMinMaxDataMap[blkIdx][blkltIdx].getMinValues(), null);
           if (!bitSet.isEmpty()) {
             String blockFileName = indexFilePath[blkIdx].substring(
                 indexFilePath[blkIdx].lastIndexOf(File.separatorChar) + 1,
@@ -168,6 +168,11 @@ public class MinMaxIndexDataMap extends CoarseGrainDataMap {
   @Override
   public void clear() {
     readMinMaxDataMap = null;
+  }
+
+  @Override
+  public void finish() {
+
   }
 
 }

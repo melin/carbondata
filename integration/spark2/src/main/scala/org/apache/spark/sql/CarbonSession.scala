@@ -36,11 +36,10 @@ import org.apache.spark.sql.optimizer.CarbonFilters
 import org.apache.spark.sql.profiler.{Profiler, SQLStart}
 import org.apache.spark.util.{CarbonReflectionUtils, Utils}
 
-import org.apache.carbondata.common.logging.LogServiceFactory
+import org.apache.carbondata.common.annotations.InterfaceAudience
+import org.apache.carbondata.common.logging.{LogService, LogServiceFactory}
 import org.apache.carbondata.core.constants.CarbonCommonConstants
-import org.apache.carbondata.core.scan.expression.LiteralExpression
 import org.apache.carbondata.core.util.{CarbonProperties, CarbonSessionInfo, ThreadLocalSessionInfo}
-import org.apache.carbondata.hadoop.util.CarbonInputFormatUtil
 import org.apache.carbondata.store.SparkCarbonStore
 import org.apache.carbondata.streaming.CarbonStreamingQueryListener
 
@@ -51,7 +50,7 @@ import org.apache.carbondata.streaming.CarbonStreamingQueryListener
  */
 class CarbonSession(@transient val sc: SparkContext,
     @transient private val existingSharedState: Option[SharedState],
-    @transient useHiveMetaStore: Boolean = true
+    @transient private val useHiveMetaStore: Boolean = true
 ) extends SparkSession(sc) { self =>
 
   def this(sc: SparkContext) {
@@ -99,15 +98,25 @@ class CarbonSession(@transient val sc: SparkContext,
             trySearchMode(qe, sse)
           } catch {
             case e: Exception =>
-              logError(String.format(
-                "Exception when executing search mode: %s, fallback to SparkSQL", e.getMessage))
-              new Dataset[Row](self, qe, RowEncoder(qe.analyzed.schema))
+              log.error(String.format(
+                "Exception when executing search mode: %s", e.getMessage))
+              throw e;
           }
         } else {
           new Dataset[Row](self, qe, RowEncoder(qe.analyzed.schema))
         }
       }
     )
+  }
+
+  /**
+   * Return true if the specified sql statement will hit the datamap
+   * This API is for test purpose only
+   */
+  @InterfaceAudience.Developer(Array("DataMap"))
+  def isDataMapHit(sqlStatement: String, dataMapName: String): Boolean = {
+    val message = sql(s"EXPLAIN $sqlStatement").collect()
+    message(0).getString(0).contains(dataMapName)
   }
 
   def isSearchModeEnabled: Boolean = carbonStore != null
@@ -160,24 +169,29 @@ class CarbonSession(@transient val sc: SparkContext,
    */
   private def trySearchMode(qe: QueryExecution, sse: SQLStart): DataFrame = {
     val analyzed = qe.analyzed
+    val LOG: LogService = LogServiceFactory.getLogService(this.getClass.getName)
     analyzed match {
       case _@Project(columns, _@Filter(expr, s: SubqueryAlias))
         if s.child.isInstanceOf[LogicalRelation] &&
            s.child.asInstanceOf[LogicalRelation].relation
              .isInstanceOf[CarbonDatasourceHadoopRelation] =>
+        LOG.info(s"Search service started and supports filter: ${sse.sqlText}")
         runSearch(analyzed, columns, expr, s.child.asInstanceOf[LogicalRelation])
       case gl@GlobalLimit(_, ll@LocalLimit(_, p@Project(columns, _@Filter(expr, s: SubqueryAlias))))
         if s.child.isInstanceOf[LogicalRelation] &&
            s.child.asInstanceOf[LogicalRelation].relation
              .isInstanceOf[CarbonDatasourceHadoopRelation] =>
         val logicalRelation = s.child.asInstanceOf[LogicalRelation]
+        LOG.info(s"Search service started and supports limit: ${sse.sqlText}")
         runSearch(analyzed, columns, expr, logicalRelation, gl.maxRows, ll.maxRows)
       case _ =>
+        LOG.info(s"Search service started, but don't support: ${sse.sqlText}," +
+          s" and will run it with SparkSQL")
         new Dataset[Row](self, qe, RowEncoder(qe.analyzed.schema))
     }
   }
 
-  private var carbonStore: SparkCarbonStore = _
+  @transient private var carbonStore: SparkCarbonStore = _
 
   def startSearchMode(): Unit = {
     CarbonProperties.enableSearchMode(true)
@@ -317,7 +331,6 @@ object CarbonSession {
             sparkConf.setAppName(randomAppName)
           }
           val sc = SparkContext.getOrCreate(sparkConf)
-          CarbonInputFormatUtil.setS3Configurations(sc.hadoopConfiguration)
           // maybe this is an existing SparkContext, update its SparkConf which maybe used
           // by SparkSession
           options.foreach { case (k, v) => sc.conf.set(k, v) }
@@ -343,12 +356,7 @@ object CarbonSession {
         // Register a successfully instantiated context to the singleton. This should be at the
         // end of the class definition so that the singleton is updated only if there is no
         // exception in the construction of the instance.
-        sparkContext.addSparkListener(new SparkListener {
-          override def onApplicationEnd(applicationEnd: SparkListenerApplicationEnd): Unit = {
-            SparkSession.setDefaultSession(null)
-            SparkSession.sqlListener.set(null)
-          }
-        })
+        CarbonToSparkAdapater.addSparkListener(sparkContext)
         session.streams.addListener(new CarbonStreamingQueryListener(session))
       }
 
@@ -418,6 +426,8 @@ object CarbonSession {
     }
     // preserve thread parameters across call
     ThreadLocalSessionInfo.setCarbonSessionInfo(carbonSessionInfo)
+    ThreadLocalSessionInfo
+      .setConfigurationToCurrentThread(sparkSession.sessionState.newHadoopConf())
   }
 
 }

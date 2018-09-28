@@ -25,8 +25,10 @@ import org.apache.carbondata.core.datamap.DataMapDistributable;
 import org.apache.carbondata.core.datamap.DataMapLevel;
 import org.apache.carbondata.core.datamap.Segment;
 import org.apache.carbondata.core.datamap.TableDataMap;
+import org.apache.carbondata.core.datamap.dev.DataMap;
 import org.apache.carbondata.core.indexstore.ExtendedBlocklet;
 import org.apache.carbondata.core.indexstore.PartitionSpec;
+import org.apache.carbondata.core.metadata.schema.table.DataMapSchema;
 import org.apache.carbondata.core.scan.filter.resolver.FilterResolverIntf;
 
 public class DataMapExprWrapperImpl implements DataMapExprWrapper {
@@ -51,6 +53,13 @@ public class DataMapExprWrapperImpl implements DataMapExprWrapper {
     return dataMap.prune(segments, expression, partitionsToPrune);
   }
 
+  public List<ExtendedBlocklet> prune(DataMapDistributable distributable,
+      List<PartitionSpec> partitionsToPrune)
+      throws IOException {
+    List<DataMap> dataMaps = dataMap.getTableDataMaps(distributable);
+    return dataMap.prune(dataMaps, distributable, expression, partitionsToPrune);
+  }
+
   @Override public List<ExtendedBlocklet> pruneBlocklets(List<ExtendedBlocklet> blocklets)
       throws IOException {
     List<ExtendedBlocklet> blockletList = new ArrayList<>();
@@ -73,7 +82,8 @@ public class DataMapExprWrapperImpl implements DataMapExprWrapper {
     return null;
   }
 
-  @Override public List<DataMapDistributableWrapper> toDistributable(List<Segment> segments)
+  @Override
+  public List<DataMapDistributableWrapper> toDistributable(List<Segment> segments)
       throws IOException {
     List<DataMapDistributable> dataMapDistributables = dataMap.toDistributable(segments);
     List<DataMapDistributableWrapper> wrappers = new ArrayList<>();
@@ -83,7 +93,21 @@ public class DataMapExprWrapperImpl implements DataMapExprWrapper {
     return wrappers;
   }
 
-  @Override public DataMapLevel getDataMapType() {
-    return dataMap.getDataMapFactory().getDataMapType();
+  @Override public DataMapLevel getDataMapLevel() {
+    return dataMap.getDataMapFactory().getDataMapLevel();
+  }
+
+  public DataMapSchema getDataMapSchema() {
+    return dataMap.getDataMapSchema();
+  }
+
+  @Override
+  public DataMapExprWrapper getLeftDataMapWrapper() {
+    return null;
+  }
+
+  @Override
+  public DataMapExprWrapper getRightDataMapWrapprt() {
+    return null;
   }
 }

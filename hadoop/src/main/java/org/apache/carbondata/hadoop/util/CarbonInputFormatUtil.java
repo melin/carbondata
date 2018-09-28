@@ -22,9 +22,12 @@ import java.text.SimpleDateFormat;
 import java.util.List;
 import java.util.Locale;
 
+import org.apache.carbondata.common.logging.LogService;
+import org.apache.carbondata.common.logging.LogServiceFactory;
 import org.apache.carbondata.core.constants.CarbonCommonConstants;
 import org.apache.carbondata.core.constants.CarbonCommonConstantsInternal;
-import org.apache.carbondata.core.datastore.impl.FileFactory;
+import org.apache.carbondata.core.datamap.DataMapJob;
+import org.apache.carbondata.core.datamap.DataMapUtil;
 import org.apache.carbondata.core.exception.InvalidConfigurationException;
 import org.apache.carbondata.core.indexstore.PartitionSpec;
 import org.apache.carbondata.core.metadata.AbsoluteTableIdentifier;
@@ -36,7 +39,6 @@ import org.apache.carbondata.core.util.ThreadLocalSessionInfo;
 import org.apache.carbondata.hadoop.CarbonProjection;
 import org.apache.carbondata.hadoop.api.CarbonInputFormat;
 import org.apache.carbondata.hadoop.api.CarbonTableInputFormat;
-import org.apache.carbondata.hadoop.api.DataMapJob;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
@@ -49,6 +51,12 @@ import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
  */
 public class CarbonInputFormatUtil {
 
+  /**
+   * Attribute for Carbon LOGGER.
+   */
+  private static final LogService LOGGER =
+      LogServiceFactory.getLogService(CarbonProperties.class.getName());
+
   public static <V> CarbonTableInputFormat<V> createCarbonInputFormat(
       AbsoluteTableIdentifier identifier,
       Job job) throws IOException {
@@ -58,6 +66,7 @@ public class CarbonInputFormatUtil {
     CarbonTableInputFormat.setTableName(
         job.getConfiguration(), identifier.getCarbonTableIdentifier().getTableName());
     FileInputFormat.addInputPath(job, new Path(identifier.getTablePath()));
+    setDataMapJobIfConfigured(job.getConfiguration());
     return carbonInputFormat;
   }
 
@@ -71,6 +80,7 @@ public class CarbonInputFormatUtil {
     CarbonTableInputFormat.setTableName(
         job.getConfiguration(), identifier.getCarbonTableIdentifier().getTableName());
     FileInputFormat.addInputPath(job, new Path(identifier.getTablePath()));
+    setDataMapJobIfConfigured(job.getConfiguration());
     return carbonTableInputFormat;
   }
 
@@ -108,11 +118,10 @@ public class CarbonInputFormatUtil {
     CarbonInputFormat.setQuerySegment(conf, identifier);
     CarbonInputFormat.setFilterPredicates(conf, filterExpression);
     CarbonInputFormat.setColumnProjection(conf, columnProjection);
-    if (dataMapJob != null &&
-        Boolean.valueOf(CarbonProperties.getInstance().getProperty(
-            CarbonCommonConstants.USE_DISTRIBUTED_DATAMAP,
-            CarbonCommonConstants.USE_DISTRIBUTED_DATAMAP_DEFAULT))) {
-      CarbonInputFormat.setDataMapJob(conf, dataMapJob);
+    if (dataMapJob != null) {
+      DataMapUtil.setDataMapJob(conf, dataMapJob);
+    } else {
+      setDataMapJobIfConfigured(conf);
     }
     // when validate segments is disabled in thread local update it to CarbonTableInputFormat
     CarbonSessionInfo carbonSessionInfo = ThreadLocalSessionInfo.getCarbonSessionInfo();
@@ -147,6 +156,17 @@ public class CarbonInputFormatUtil {
     return format;
   }
 
+  /**
+   * This method set DataMapJob if configured
+   *
+   * @param conf
+   * @throws IOException
+   */
+  public static void setDataMapJobIfConfigured(Configuration conf) throws IOException {
+    String className = "org.apache.carbondata.spark.rdd.SparkDataMapJob";
+    DataMapUtil.setDataMapJob(conf, DataMapUtil.createDataMapJob(className));
+  }
+
   public static String createJobTrackerID(java.util.Date date) {
     return new SimpleDateFormat("yyyyMMddHHmmss", Locale.US).format(date);
   }
@@ -156,20 +176,4 @@ public class CarbonInputFormatUtil {
     return new JobID(jobtrackerID, batch);
   }
 
-  public static void setS3Configurations(Configuration hadoopConf) {
-    FileFactory.getConfiguration()
-        .set("fs.s3a.access.key", hadoopConf.get("fs.s3a.access.key", ""));
-    FileFactory.getConfiguration()
-        .set("fs.s3a.secret.key", hadoopConf.get("fs.s3a.secret.key", ""));
-    FileFactory.getConfiguration()
-        .set("fs.s3a.endpoint", hadoopConf.get("fs.s3a.endpoint", ""));
-    FileFactory.getConfiguration().set(CarbonCommonConstants.S3_ACCESS_KEY,
-        hadoopConf.get(CarbonCommonConstants.S3_ACCESS_KEY, ""));
-    FileFactory.getConfiguration().set(CarbonCommonConstants.S3_SECRET_KEY,
-        hadoopConf.get(CarbonCommonConstants.S3_SECRET_KEY, ""));
-    FileFactory.getConfiguration().set(CarbonCommonConstants.S3N_ACCESS_KEY,
-        hadoopConf.get(CarbonCommonConstants.S3N_ACCESS_KEY, ""));
-    FileFactory.getConfiguration().set(CarbonCommonConstants.S3N_SECRET_KEY,
-        hadoopConf.get(CarbonCommonConstants.S3N_SECRET_KEY, ""));
-  }
 }

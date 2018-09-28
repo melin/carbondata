@@ -110,6 +110,10 @@ public class BlockletFilterScanner extends BlockletFullScanner {
         totalPagesScanned.getCount() + dataBlock.numberOfPages());
     // apply min max
     if (isMinMaxEnabled) {
+      if (null == dataBlock.getColumnsMaxValue()
+              || null == dataBlock.getColumnsMinValue()) {
+        return true;
+      }
       BitSet bitSet = null;
       // check for implicit include filter instance
       if (filterExecuter instanceof ImplicitColumnFilterExecutor) {
@@ -118,11 +122,11 @@ public class BlockletFilterScanner extends BlockletFullScanner {
         bitSet = ((ImplicitColumnFilterExecutor) filterExecuter)
             .isFilterValuesPresentInBlockOrBlocklet(
                 dataBlock.getColumnsMaxValue(),
-                dataBlock.getColumnsMinValue(), blockletId);
+                dataBlock.getColumnsMinValue(), blockletId, dataBlock.minMaxFlagArray());
       } else {
         bitSet = this.filterExecuter
             .isScanRequired(dataBlock.getColumnsMaxValue(),
-                dataBlock.getColumnsMinValue());
+                dataBlock.getColumnsMinValue(), dataBlock.minMaxFlagArray());
       }
       return !bitSet.isEmpty();
     }
@@ -164,7 +168,8 @@ public class BlockletFilterScanner extends BlockletFullScanner {
     totalBlockletStatistic.addCountStatistic(QueryStatisticsConstants.TOTAL_BLOCKLET_NUM,
         totalBlockletStatistic.getCount() + 1);
     // set the indexed data if it has any during fgdatamap pruning.
-    rawBlockletColumnChunks.setBitSetGroup(rawBlockletColumnChunks.getDataBlock().getIndexedData());
+    BitSetGroup fgBitSetGroup = rawBlockletColumnChunks.getDataBlock().getIndexedData();
+    rawBlockletColumnChunks.setBitSetGroup(fgBitSetGroup);
     // apply filter on actual data, for each page
     BitSetGroup bitSetGroup = this.filterExecuter.applyFilter(rawBlockletColumnChunks,
         useBitSetPipeLine);
@@ -185,7 +190,8 @@ public class BlockletFilterScanner extends BlockletFullScanner {
       return createEmptyResult();
     }
 
-    BlockletScannedResult scannedResult = new FilterQueryScannedResult(blockExecutionInfo);
+    BlockletScannedResult scannedResult =
+        new FilterQueryScannedResult(blockExecutionInfo, queryStatisticsModel);
     scannedResult.setBlockletId(
         blockExecutionInfo.getBlockIdString() + CarbonCommonConstants.FILE_SEPARATOR +
             rawBlockletColumnChunks.getDataBlock().blockletIndex());

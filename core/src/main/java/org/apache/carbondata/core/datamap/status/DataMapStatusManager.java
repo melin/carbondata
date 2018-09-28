@@ -18,7 +18,9 @@ package org.apache.carbondata.core.datamap.status;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.carbondata.common.exceptions.sql.NoSuchDataMapException;
 import org.apache.carbondata.core.datamap.DataMapStoreManager;
@@ -51,7 +53,32 @@ public class DataMapStatusManager {
     return storageProvider.getDataMapStatusDetails();
   }
 
-  public static void disableDataMap(String dataMapName) throws Exception {
+  /**
+   * Get enabled datamap status details
+   * @return
+   * @throws IOException
+   */
+  public static DataMapStatusDetail[] getEnabledDataMapStatusDetails() throws IOException {
+    DataMapStatusDetail[] dataMapStatusDetails = storageProvider.getDataMapStatusDetails();
+    List<DataMapStatusDetail> statusDetailList = new ArrayList<>();
+    for (DataMapStatusDetail statusDetail : dataMapStatusDetails) {
+      if (statusDetail.getStatus() == DataMapStatus.ENABLED) {
+        statusDetailList.add(statusDetail);
+      }
+    }
+    return statusDetailList.toArray(new DataMapStatusDetail[statusDetailList.size()]);
+  }
+
+  public static Map<String, DataMapStatusDetail> readDataMapStatusMap() throws IOException {
+    DataMapStatusDetail[] details = storageProvider.getDataMapStatusDetails();
+    Map<String, DataMapStatusDetail> map = new HashMap<>(details.length);
+    for (DataMapStatusDetail detail : details) {
+      map.put(detail.getDataMapName(), detail);
+    }
+    return map;
+  }
+
+  public static void disableDataMap(String dataMapName) throws IOException, NoSuchDataMapException {
     DataMapSchema dataMapSchema = getDataMapSchema(dataMapName);
     if (dataMapSchema != null) {
       List<DataMapSchema> list = new ArrayList<>();
@@ -60,10 +87,21 @@ public class DataMapStatusManager {
     }
   }
 
-  public static void disableDataMapsOfTable(CarbonTable table) throws IOException {
+  /**
+   * This method will disable all lazy (DEFERRED REBUILD) datamap in the given table
+   */
+  public static void disableAllLazyDataMaps(CarbonTable table) throws IOException {
     List<DataMapSchema> allDataMapSchemas =
         DataMapStoreManager.getInstance().getDataMapSchemasOfTable(table);
-    storageProvider.updateDataMapStatus(allDataMapSchemas, DataMapStatus.DISABLED);
+    List<DataMapSchema> dataMapToBeDisabled = new ArrayList<>(allDataMapSchemas.size());
+    for (DataMapSchema dataMap : allDataMapSchemas) {
+      // TODO all non datamaps like MV is now supports only lazy. Once the support is made the
+      // following check can be removed.
+      if (dataMap.isLazy() || !dataMap.isIndexDataMap()) {
+        dataMapToBeDisabled.add(dataMap);
+      }
+    }
+    storageProvider.updateDataMapStatus(dataMapToBeDisabled, DataMapStatus.DISABLED);
   }
 
   public static void enableDataMap(String dataMapName) throws IOException, NoSuchDataMapException {
@@ -73,12 +111,6 @@ public class DataMapStatusManager {
       list.add(dataMapSchema);
       storageProvider.updateDataMapStatus(list, DataMapStatus.ENABLED);
     }
-  }
-
-  public static void enableDataMapsOfTable(CarbonTable table) throws IOException {
-    List<DataMapSchema> allDataMapSchemas =
-        DataMapStoreManager.getInstance().getDataMapSchemasOfTable(table);
-    storageProvider.updateDataMapStatus(allDataMapSchemas, DataMapStatus.ENABLED);
   }
 
   public static void dropDataMap(String dataMapName) throws IOException, NoSuchDataMapException {

@@ -23,6 +23,7 @@ import java.util.LinkedList;
 import java.util.Map;
 import javax.annotation.concurrent.GuardedBy;
 
+import org.apache.carbondata.core.constants.CarbonCommonConstants;
 import org.apache.carbondata.core.util.CarbonProperties;
 
 /**
@@ -39,8 +40,11 @@ public class HeapMemoryAllocator implements MemoryAllocator {
 
   public HeapMemoryAllocator() {
     poolingThresholdBytes = CarbonProperties.getInstance().getHeapMemoryPoolingThresholdBytes();
-    // if set 'poolingThresholdBytes' to -1, it should not go through the pooling mechanism.
-    if (poolingThresholdBytes == -1) {
+    boolean isDriver = Boolean.parseBoolean(CarbonProperties.getInstance()
+        .getProperty(CarbonCommonConstants.IS_DRIVER_INSTANCE, "false"));
+    // if set 'poolingThresholdBytes' to -1 or the object creation call is in driver,
+    // it should not go through the pooling mechanism.
+    if (poolingThresholdBytes == -1 || isDriver) {
       shouldPooling = false;
     }
   }
@@ -87,7 +91,6 @@ public class HeapMemoryAllocator implements MemoryAllocator {
     // As an additional layer of defense against use-after-free bugs, we mutate the
     // MemoryBlock to null out its reference to the long[] array.
     long[] array = (long[]) memory.obj;
-    memory.setObjAndOffset(null, 0);
 
     long alignedSize = ((size + 7) / 8) * 8;
     if (shouldPool(alignedSize)) {

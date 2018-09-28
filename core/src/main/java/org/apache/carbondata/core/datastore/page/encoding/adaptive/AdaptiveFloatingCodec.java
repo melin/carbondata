@@ -27,7 +27,6 @@ import org.apache.carbondata.core.datastore.compression.CompressorFactory;
 import org.apache.carbondata.core.datastore.page.ColumnPage;
 import org.apache.carbondata.core.datastore.page.ColumnPageValueConverter;
 import org.apache.carbondata.core.datastore.page.LazyColumnPage;
-import org.apache.carbondata.core.datastore.page.encoding.ColumnPageCodec;
 import org.apache.carbondata.core.datastore.page.encoding.ColumnPageDecoder;
 import org.apache.carbondata.core.datastore.page.encoding.ColumnPageEncoder;
 import org.apache.carbondata.core.datastore.page.encoding.ColumnPageEncoderMeta;
@@ -35,6 +34,7 @@ import org.apache.carbondata.core.datastore.page.statistics.SimpleStatsResult;
 import org.apache.carbondata.core.memory.MemoryException;
 import org.apache.carbondata.core.metadata.datatype.DataType;
 import org.apache.carbondata.core.metadata.datatype.DataTypes;
+import org.apache.carbondata.format.DataChunk2;
 import org.apache.carbondata.format.Encoding;
 
 /**
@@ -44,18 +44,14 @@ import org.apache.carbondata.format.Encoding;
  */
 public class AdaptiveFloatingCodec extends AdaptiveCodec {
 
-  private ColumnPage encodedPage;
-  private Double factor;
-
-  public static ColumnPageCodec newInstance(DataType srcDataType, DataType targetDataType,
-      SimpleStatsResult stats) {
-    return new AdaptiveFloatingCodec(srcDataType, targetDataType, stats);
-  }
+  private double factor;
+  private float floatFactor;
 
   public AdaptiveFloatingCodec(DataType srcDataType, DataType targetDataType,
-      SimpleStatsResult stats) {
-    super(srcDataType, targetDataType, stats);
+      SimpleStatsResult stats, boolean isInvertedIndex) {
+    super(srcDataType, targetDataType, stats, isInvertedIndex);
     this.factor = Math.pow(10, stats.getDecimalCount());
+    this.floatFactor = (float) factor;
   }
 
   @Override
@@ -65,18 +61,21 @@ public class AdaptiveFloatingCodec extends AdaptiveCodec {
 
   @Override
   public ColumnPageEncoder createEncoder(Map<String, String> parameter) {
-    final Compressor compressor = CompressorFactory.getInstance().getCompressor();
     return new ColumnPageEncoder() {
+      byte[] result = null;
       @Override
       protected byte[] encodeData(ColumnPage input) throws MemoryException, IOException {
         if (encodedPage != null) {
           throw new IllegalStateException("already encoded");
         }
-        encodedPage = ColumnPage.newPage(input.getColumnSpec(), targetDataType,
-            input.getPageSize());
-        input.convertValue(converter);
-        byte[] result = encodedPage.compress(compressor);
+        Compressor compressor =
+            CompressorFactory.getInstance().getCompressor(input.getColumnCompressorName());
+        result = encodeAndCompressPage(input, converter, compressor);
+        byte[] bytes = writeInvertedIndexIfRequired(result);
         encodedPage.freeMemory();
+        if (bytes.length != 0) {
+          return bytes;
+        }
         return result;
       }
 
@@ -84,13 +83,21 @@ public class AdaptiveFloatingCodec extends AdaptiveCodec {
       protected List<Encoding> getEncodingList() {
         List<Encoding> encodings = new ArrayList<Encoding>();
         encodings.add(Encoding.ADAPTIVE_FLOATING);
+        if (null != indexStorage && indexStorage.getRowIdPageLengthInBytes() > 0) {
+          encodings.add(Encoding.INVERTED_INDEX);
+        }
         return encodings;
       }
 
       @Override
       protected ColumnPageEncoderMeta getEncoderMeta(ColumnPage inputPage) {
         return new ColumnPageEncoderMeta(inputPage.getColumnSpec(), targetDataType, stats,
-            compressor.getName());
+            inputPage.getColumnCompressorName());
+      }
+
+      @Override
+      protected void fillLegacyFields(DataChunk2 dataChunk) throws IOException {
+        fillLegacyFieldsIfRequired(dataChunk, result);
       }
 
     };
@@ -102,8 +109,13 @@ public class AdaptiveFloatingCodec extends AdaptiveCodec {
       @Override
       public ColumnPage decode(byte[] input, int offset, int length)
           throws MemoryException, IOException {
-        ColumnPage page = ColumnPage.decompress(meta, input, offset, length);
+        ColumnPage page = ColumnPage.decompress(meta, input, offset, length, false);
         return LazyColumnPage.newPage(page, converter);
+      }
+
+      @Override public ColumnPage decode(byte[] input, int offset, int length, boolean isLVEncoded)
+          throws MemoryException, IOException {
+        return decode(input, offset, length);
       }
     };
   }
@@ -137,15 +149,15 @@ public class AdaptiveFloatingCodec extends AdaptiveCodec {
     @Override
     public void encode(int rowId, float value) {
       if (targetDataType == DataTypes.BYTE) {
-        encodedPage.putByte(rowId, (byte) (value * factor));
+        encodedPage.putByte(rowId, (byte) (value * floatFactor));
       } else if (targetDataType == DataTypes.SHORT) {
-        encodedPage.putShort(rowId, (short) (value * factor));
+        encodedPage.putShort(rowId, (short) (value * floatFactor));
       } else if (targetDataType == DataTypes.SHORT_INT) {
-        encodedPage.putShortInt(rowId, (int) (value * factor));
+        encodedPage.putShortInt(rowId, (int) (value * floatFactor));
       } else if (targetDataType == DataTypes.INT) {
-        encodedPage.putInt(rowId, (int) (value * factor));
+        encodedPage.putInt(rowId, (int) (value * floatFactor));
       } else if (targetDataType == DataTypes.LONG) {
-        encodedPage.putLong(rowId, (long) (value * factor));
+        encodedPage.putLong(rowId, (long) (value * floatFactor));
       } else {
         throw new RuntimeException("internal error: " + debugInfo());
       }

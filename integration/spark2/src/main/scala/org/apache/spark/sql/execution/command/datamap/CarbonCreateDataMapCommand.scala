@@ -24,11 +24,14 @@ import org.apache.spark.sql.execution.command._
 
 import org.apache.carbondata.common.exceptions.sql.{MalformedCarbonCommandException, MalformedDataMapCommandException}
 import org.apache.carbondata.common.logging.LogServiceFactory
-import org.apache.carbondata.core.datamap.{DataMapProvider, DataMapStoreManager, IndexDataMapProvider}
+import org.apache.carbondata.core.datamap.{DataMapProvider, DataMapStoreManager}
 import org.apache.carbondata.core.datamap.status.DataMapStatusManager
-import org.apache.carbondata.core.metadata.schema.datamap.DataMapClassProvider
+import org.apache.carbondata.core.metadata.ColumnarFormatVersion
+import org.apache.carbondata.core.metadata.schema.datamap.{DataMapClassProvider, DataMapProperty}
 import org.apache.carbondata.core.metadata.schema.table.{CarbonTable, DataMapSchema}
-import org.apache.carbondata.datamap.DataMapManager
+import org.apache.carbondata.core.util.{CarbonProperties, CarbonUtil}
+import org.apache.carbondata.datamap.{DataMapManager, IndexDataMapProvider}
+import org.apache.carbondata.events._
 
 /**
  * Below command class will be used to create datamap on table
@@ -37,12 +40,14 @@ import org.apache.carbondata.datamap.DataMapManager
 case class CarbonCreateDataMapCommand(
     dataMapName: String,
     tableIdentifier: Option[TableIdentifier],
-    dmClassName: String,
+    dmProviderName: String,
     dmProperties: Map[String, String],
     queryString: Option[String],
-    ifNotExistsSet: Boolean = false)
+    ifNotExistsSet: Boolean = false,
+    var deferredRebuild: Boolean = false)
   extends AtomicRunnableCommand {
 
+  private val LOGGER = LogServiceFactory.getLogService(this.getClass.getName)
   private var dataMapProvider: DataMapProvider = _
   private var mainTable: CarbonTable = _
   private var dataMapSchema: DataMapSchema = _
@@ -68,58 +73,107 @@ case class CarbonCreateDataMapCommand(
       }
     }
 
-    dataMapSchema = new DataMapSchema(dataMapName, dmClassName)
-    // TODO: move this if logic inside lucene module
-    if (dataMapSchema.getProviderName.equalsIgnoreCase(DataMapClassProvider.LUCENE.toString)) {
-      val datamaps = DataMapStoreManager.getInstance().getAllDataMap(mainTable).asScala
-      if (datamaps.nonEmpty) {
-        datamaps.foreach(datamap => {
-          val dmColumns = datamap.getDataMapSchema.getProperties.get("text_columns")
-          val existingColumns = dmProperties("text_columns")
+    if (mainTable !=null && CarbonUtil.getFormatVersion(mainTable) != ColumnarFormatVersion.V3) {
+      throw new MalformedCarbonCommandException(s"Unsupported operation on table with " +
+                                                s"V1 or V2 format data")
+    }
 
-          def getAllSubString(columns: String): Set[String] = {
-            columns.inits.flatMap(_.tails).toSet
-          }
+    dataMapSchema = new DataMapSchema(dataMapName, dmProviderName)
 
-          val existingClmSets = getAllSubString(existingColumns)
-          val dmColumnsSets = getAllSubString(dmColumns)
-          val duplicateDMColumn = existingClmSets.intersect(dmColumnsSets).maxBy(_.length)
-          if (!duplicateDMColumn.isEmpty) {
-            throw new MalformedDataMapCommandException(
-              s"Create lucene datamap $dataMapName failed, datamap already exists on column(s) " +
-              s"$duplicateDMColumn")
-          }
-        })
+    val property = dmProperties.map(x => (x._1.trim, x._2.trim)).asJava
+    val javaMap = new java.util.HashMap[String, String](property)
+    // for MV, it is deferred rebuild by default and cannot be non-deferred rebuild
+    if (dataMapSchema.getProviderName.equalsIgnoreCase(DataMapClassProvider.MV.getShortName)) {
+      if (!deferredRebuild) {
+        LOGGER.warn(s"DEFERRED REBUILD is enabled by default for MV datamap $dataMapName")
       }
+      deferredRebuild = true
     }
-    if (mainTable != null &&
-        mainTable.isStreamingTable &&
-        !(dataMapSchema.getProviderName.equalsIgnoreCase(DataMapClassProvider.PREAGGREGATE.toString)
-          || dataMapSchema.getProviderName
-            .equalsIgnoreCase(DataMapClassProvider.TIMESERIES.toString))) {
-      throw new MalformedCarbonCommandException(s"Streaming table does not support creating ${
-        dataMapSchema.getProviderName
-      } datamap")
+    javaMap.put(DataMapProperty.DEFERRED_REBUILD, deferredRebuild.toString)
+    dataMapSchema.setProperties(javaMap)
+
+    if (dataMapSchema.isIndexDataMap && mainTable == null) {
+      throw new MalformedDataMapCommandException(
+        "For this datamap, main table is required. Use `CREATE DATAMAP ... ON TABLE ...` ")
     }
-    dataMapSchema.setProperties(new java.util.HashMap[String, String](
-      dmProperties.map(x => (x._1.trim, x._2.trim)).asJava))
-    dataMapProvider = DataMapManager.get().getDataMapProvider(dataMapSchema, sparkSession)
-    dataMapProvider.initMeta(mainTable, dataMapSchema, queryString.orNull)
-    // TODO Currently this feature is only available for index datamaps
-    if (dataMapProvider.isInstanceOf[IndexDataMapProvider]) {
-      DataMapStatusManager.disableDataMap(dataMapName)
+    dataMapProvider = DataMapManager.get.getDataMapProvider(mainTable, dataMapSchema, sparkSession)
+    if (deferredRebuild && !dataMapProvider.supportRebuild()) {
+      throw new MalformedDataMapCommandException(
+        s"DEFERRED REBUILD is not supported on this datamap $dataMapName" +
+        s" with provider ${dataMapSchema.getProviderName}")
     }
-    val LOGGER = LogServiceFactory.getLogService(this.getClass.getCanonicalName)
+
+    val systemFolderLocation: String = CarbonProperties.getInstance().getSystemFolderLocation
+    val operationContext: OperationContext = new OperationContext()
+
+    // If it is index datamap, check whether the column has datamap created already
+    dataMapProvider match {
+      case provider: IndexDataMapProvider =>
+        val isBloomFilter = DataMapClassProvider.BLOOMFILTER.getShortName
+          .equalsIgnoreCase(dmProviderName)
+        val datamaps = DataMapStoreManager.getInstance.getAllDataMap(mainTable).asScala
+        val thisDmProviderName =
+          dataMapProvider.asInstanceOf[IndexDataMapProvider].getDataMapSchema.getProviderName
+        val existingIndexColumn4ThisProvider = datamaps.filter { datamap =>
+          thisDmProviderName.equalsIgnoreCase(datamap.getDataMapSchema.getProviderName)
+        }.flatMap { datamap =>
+          datamap.getDataMapSchema.getIndexColumns
+        }.distinct
+
+        provider.getIndexedColumns.asScala.foreach { column =>
+          if (existingIndexColumn4ThisProvider.contains(column.getColName)) {
+            throw new MalformedDataMapCommandException(String.format(
+              "column '%s' already has %s index datamap created",
+              column.getColName, thisDmProviderName))
+          } else if (isBloomFilter) {
+            // if datamap provider is bloomfilter,the index column datatype cannot be complex type
+            if (column.isComplex) {
+              throw new MalformedDataMapCommandException(
+                s"BloomFilter datamap does not support complex datatype column: ${
+                  column.getColName
+                }")
+            }
+          }
+        }
+
+        val createDataMapPreExecutionEvent: CreateDataMapPreExecutionEvent =
+          new CreateDataMapPreExecutionEvent(sparkSession,
+            systemFolderLocation, tableIdentifier.get)
+        OperationListenerBus.getInstance().fireEvent(createDataMapPreExecutionEvent,
+          operationContext)
+        dataMapProvider.initMeta(queryString.orNull)
+        DataMapStatusManager.disableDataMap(dataMapName)
+      case _ =>
+        dataMapProvider.initMeta(queryString.orNull)
+    }
+    val createDataMapPostExecutionEvent: CreateDataMapPostExecutionEvent =
+      new CreateDataMapPostExecutionEvent(sparkSession,
+        systemFolderLocation, tableIdentifier, dmProviderName)
+    OperationListenerBus.getInstance().fireEvent(createDataMapPostExecutionEvent,
+      operationContext)
     LOGGER.audit(s"DataMap $dataMapName successfully added")
     Seq.empty
   }
 
   override def processData(sparkSession: SparkSession): Seq[Row] = {
     if (dataMapProvider != null) {
-      dataMapProvider.initData(mainTable)
-      if (mainTable != null && mainTable.isAutoRefreshDataMap) {
-        if (!DataMapClassProvider.LUCENE.getShortName.equals(dataMapSchema.getProviderName)) {
-          dataMapProvider.rebuild(mainTable, dataMapSchema)
+      dataMapProvider.initData()
+      if (mainTable != null && !deferredRebuild) {
+        dataMapProvider.rebuild()
+        if (dataMapSchema.isIndexDataMap) {
+          val operationContext: OperationContext = new OperationContext()
+          val systemFolderLocation: String = CarbonProperties.getInstance().getSystemFolderLocation
+          val updateDataMapPreExecutionEvent: UpdateDataMapPreExecutionEvent =
+            new UpdateDataMapPreExecutionEvent(sparkSession,
+              systemFolderLocation, tableIdentifier.get)
+          OperationListenerBus.getInstance().fireEvent(updateDataMapPreExecutionEvent,
+            operationContext)
+          DataMapStatusManager.enableDataMap(dataMapName)
+          val updateDataMapPostExecutionEvent: UpdateDataMapPostExecutionEvent =
+            new UpdateDataMapPostExecutionEvent(sparkSession,
+              systemFolderLocation, tableIdentifier.get)
+          OperationListenerBus.getInstance().fireEvent(updateDataMapPostExecutionEvent,
+            operationContext)
         }
       }
     }
@@ -128,7 +182,11 @@ case class CarbonCreateDataMapCommand(
 
   override def undoMetadata(sparkSession: SparkSession, exception: Exception): Seq[Row] = {
     if (dataMapProvider != null) {
-      dataMapProvider.freeMeta(mainTable, dataMapSchema)
+        CarbonDropDataMapCommand(
+          dataMapName,
+          true,
+          Some(TableIdentifier(mainTable.getTableName, Some(mainTable.getDatabaseName))),
+          forceDrop = false).run(sparkSession)
     }
     Seq.empty
   }

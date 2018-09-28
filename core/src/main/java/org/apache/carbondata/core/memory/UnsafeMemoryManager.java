@@ -41,29 +41,50 @@ public class UnsafeMemoryManager {
           CarbonCommonConstants.ENABLE_OFFHEAP_SORT_DEFAULT));
   private static Map<Long,Set<MemoryBlock>> taskIdToMemoryBlockMap;
   static {
-    long size;
+    long size = 0L;
+    String defaultWorkingMemorySize = null;
     try {
-      size = Long.parseLong(CarbonProperties.getInstance()
-          .getProperty(CarbonCommonConstants.UNSAFE_WORKING_MEMORY_IN_MB,
-              CarbonCommonConstants.UNSAFE_WORKING_MEMORY_IN_MB_DEFAULT));
+      // check if driver unsafe memory is configured and JVM process is in driver. In that case
+      // initialize unsafe memory configured for driver
+      boolean isDriver = Boolean.parseBoolean(CarbonProperties.getInstance()
+          .getProperty(CarbonCommonConstants.IS_DRIVER_INSTANCE, "false"));
+      boolean initializedWithUnsafeDriverMemory = false;
+      if (isDriver) {
+        defaultWorkingMemorySize = CarbonProperties.getInstance()
+            .getProperty(CarbonCommonConstants.UNSAFE_DRIVER_WORKING_MEMORY_IN_MB);
+        if (null != defaultWorkingMemorySize) {
+          size = Long.parseLong(defaultWorkingMemorySize);
+          initializedWithUnsafeDriverMemory = true;
+        }
+      }
+      if (!initializedWithUnsafeDriverMemory) {
+        defaultWorkingMemorySize = CarbonProperties.getInstance()
+            .getProperty(CarbonCommonConstants.UNSAFE_WORKING_MEMORY_IN_MB);
+        if (null != defaultWorkingMemorySize) {
+          size = Long.parseLong(defaultWorkingMemorySize);
+        }
+      }
     } catch (Exception e) {
-      size = Long.parseLong(CarbonCommonConstants.UNSAFE_WORKING_MEMORY_IN_MB_DEFAULT);
-      LOGGER.info("Wrong memory size given, "
-          + "so setting default value to " + size);
+      LOGGER.info("Invalid memory size value: " + defaultWorkingMemorySize);
     }
-    if (size < 512) {
-      size = 512;
-      LOGGER.info("It is not recommended to keep unsafe memory size less than 512MB, "
-          + "so setting default value to " + size);
-    }
-    long takenSize = size * 1024 * 1024;
+    long takenSize = size;
     MemoryAllocator allocator;
     if (offHeap) {
       allocator = MemoryAllocator.UNSAFE;
+      long defaultSize = Long.parseLong(CarbonCommonConstants.UNSAFE_WORKING_MEMORY_IN_MB_DEFAULT);
+      if (takenSize < defaultSize) {
+        takenSize = defaultSize;
+      }
+      takenSize = takenSize * 1024 * 1024;
     } else {
       long maxMemory = Runtime.getRuntime().maxMemory() * 60 / 100;
-      if (takenSize > maxMemory) {
+      if (takenSize == 0L) {
         takenSize = maxMemory;
+      } else {
+        takenSize = takenSize * 1024 * 1024;
+        if (takenSize > maxMemory) {
+          takenSize = maxMemory;
+        }
       }
       allocator = MemoryAllocator.HEAP;
     }
@@ -86,9 +107,10 @@ public class UnsafeMemoryManager {
         .info("Working Memory manager is created with size " + totalMemory + " with " + allocator);
   }
 
-  private synchronized MemoryBlock allocateMemory(long taskId, long memoryRequested) {
+  private synchronized MemoryBlock allocateMemory(MemoryAllocator memoryAllocator, long taskId,
+      long memoryRequested) {
     if (memoryUsed + memoryRequested <= totalMemory) {
-      MemoryBlock allocate = allocator.allocate(memoryRequested);
+      MemoryBlock allocate = memoryAllocator.allocate(memoryRequested);
       memoryUsed += allocate.size();
       Set<MemoryBlock> listOfMemoryBlock = taskIdToMemoryBlockMap.get(taskId);
       if (null == listOfMemoryBlock) {
@@ -107,11 +129,16 @@ public class UnsafeMemoryManager {
   }
 
   public synchronized void freeMemory(long taskId, MemoryBlock memoryBlock) {
+    freeMemory(allocator, taskId, memoryBlock);
+  }
+
+  public synchronized void freeMemory(MemoryAllocator memoryAllocator, long taskId,
+      MemoryBlock memoryBlock) {
     if (taskIdToMemoryBlockMap.containsKey(taskId)) {
       taskIdToMemoryBlockMap.get(taskId).remove(memoryBlock);
     }
     if (!memoryBlock.isFreedStatus()) {
-      allocator.free(memoryBlock);
+      memoryAllocator.free(memoryBlock);
       memoryUsed -= memoryBlock.size();
       memoryUsed = memoryUsed < 0 ? 0 : memoryUsed;
       if (LOGGER.isDebugEnabled()) {
@@ -159,11 +186,17 @@ public class UnsafeMemoryManager {
   /**
    * It tries to allocate memory of `size` bytes, keep retry until it allocates successfully.
    */
-  public static MemoryBlock allocateMemoryWithRetry(long taskId, long size) throws MemoryException {
+  public static MemoryBlock allocateMemoryWithRetry(long taskId, long size)
+      throws MemoryException {
+    return allocateMemoryWithRetry(INSTANCE.allocator, taskId, size);
+  }
+
+  public static MemoryBlock allocateMemoryWithRetry(MemoryAllocator memoryAllocator, long taskId,
+      long size) throws MemoryException {
     MemoryBlock baseBlock = null;
     int tries = 0;
     while (tries < 300) {
-      baseBlock = INSTANCE.allocateMemory(taskId, size);
+      baseBlock = INSTANCE.allocateMemory(memoryAllocator, taskId, size);
       if (baseBlock == null) {
         try {
           LOGGER.info("Memory is not available, retry after 500 millis");
@@ -177,14 +210,19 @@ public class UnsafeMemoryManager {
       tries++;
     }
     if (baseBlock == null) {
-      LOGGER.error(" Memory Used : " + INSTANCE.memoryUsed + " Tasks running : "
-          + taskIdToMemoryBlockMap.keySet());
-      throw new MemoryException("Not enough memory");
+      INSTANCE.printCurrentMemoryUsage();
+      throw new MemoryException(
+          "Not enough memory. please increase carbon.unsafe.working.memory.in.mb");
     }
     return baseBlock;
   }
 
   public static boolean isOffHeap() {
     return offHeap;
+  }
+
+  private synchronized void printCurrentMemoryUsage() {
+    LOGGER.error(
+        " Memory Used : " + memoryUsed + " Tasks running : " + taskIdToMemoryBlockMap.keySet());
   }
 }

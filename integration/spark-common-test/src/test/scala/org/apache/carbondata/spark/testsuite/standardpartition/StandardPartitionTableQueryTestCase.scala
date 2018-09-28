@@ -17,7 +17,7 @@
 package org.apache.carbondata.spark.testsuite.standardpartition
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.execution.BatchedDataSourceScanExec
+import org.apache.spark.sql.execution.strategy.CarbonDataSourceScan
 import org.apache.spark.sql.test.Spark2TestQueryExecutor
 import org.apache.spark.sql.test.util.QueryTest
 import org.apache.spark.sql.{DataFrame, Row}
@@ -71,6 +71,27 @@ class StandardPartitionTableQueryTestCase extends QueryTest with BeforeAndAfterA
     checkAnswer(frame,
       sql("select  empno, empname, designation, doj, workgroupcategory, workgroupcategoryname, deptno, deptname, projectcode, projectjoindate, projectenddate, attendance, utilization, salary from originTable where empno=11 order by empno"))
 
+  }
+
+  test("create partition table by dataframe") {
+    sql("select * from originTable")
+      .write
+      .format("carbondata")
+      .option("tableName", "partitionxxx")
+      .option("partitionColumns", "empno")
+      .save("Overwrite")
+
+    val frame = sql(
+      "select empno, empname, designation, doj, workgroupcategory, workgroupcategoryname, deptno," +
+      " deptname, projectcode, projectjoindate, projectenddate, attendance, utilization, salary " +
+      "from partitionxxx where empno=11 order by empno")
+    verifyPartitionInfo(frame, Seq("empno=11"))
+
+    checkAnswer(frame,
+      sql("select  empno, empname, designation, doj, workgroupcategory, workgroupcategoryname, deptno, " +
+          "deptname, projectcode, projectjoindate, projectenddate, attendance, utilization, salary " +
+          "from originTable where empno=11 order by empno"))
+    sql("drop table if exists partitionxxx")
   }
 
   test("querying on partition table for string partition column") {
@@ -248,17 +269,10 @@ class StandardPartitionTableQueryTestCase extends QueryTest with BeforeAndAfterA
 test("Creation of partition table should fail if the colname in table schema and partition column is same even if both are case sensitive"){
 
   val exception = intercept[Exception]{
-    sql("CREATE TABLE uniqdata_char2(name char,id int) partitioned by (NAME char)stored by 'carbondata' ")
+    sql("CREATE TABLE uniqdata_char2(name char(10),id int) partitioned by (NAME char(10))stored by 'carbondata' ")
   }
-  if(Spark2TestQueryExecutor.spark.version.startsWith("2.1.0")){
     assert(exception.getMessage.contains("Operation not allowed: Partition columns should not be " +
                                          "specified in the schema: [\"name\"]"))
-  }
-  else{
-    //spark 2.2 allow creating char data type only with digits thats why this assert is here as it will throw this exception
-    assert(exception.getMessage.contains("DataType char is not supported"))
-
-  }
 }
 
   test("Creation of partition table should fail for both spark version with same exception when char data type is created with specified digit and colname in table schema and partition column is same even if both are case sensitive"){
@@ -427,7 +441,7 @@ test("Creation of partition table should fail if the colname in table schema and
   private def verifyPartitionInfo(frame: DataFrame, partitionNames: Seq[String]) = {
     val plan = frame.queryExecution.sparkPlan
     val scanRDD = plan collect {
-      case b: BatchedDataSourceScanExec if b.rdd.isInstanceOf[CarbonScanRDD[InternalRow]] => b.rdd
+      case b: CarbonDataSourceScan if b.rdd.isInstanceOf[CarbonScanRDD[InternalRow]] => b.rdd
         .asInstanceOf[CarbonScanRDD[InternalRow]]
     }
     assert(scanRDD.nonEmpty)

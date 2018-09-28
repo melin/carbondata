@@ -36,9 +36,11 @@ import org.apache.spark.sql.types._
 import org.apache.spark.util.CarbonReflectionUtils
 
 import org.apache.carbondata.core.constants.{CarbonCommonConstants, CarbonCommonConstantsInternal}
+import org.apache.carbondata.core.metadata.schema.datamap.DataMapClassProvider
 import org.apache.carbondata.core.metadata.schema.table.{AggregationDataMapSchema, CarbonTable, DataMapSchema}
 import org.apache.carbondata.core.metadata.schema.table.column.ColumnSchema
 import org.apache.carbondata.core.preagg.{AggregateQueryPlan, AggregateTableSelector, QueryColumn}
+import org.apache.carbondata.core.profiler.ExplainCollector
 import org.apache.carbondata.core.statusmanager.SegmentStatusManager
 import org.apache.carbondata.core.util.{CarbonUtil, ThreadLocalSessionInfo}
 
@@ -271,11 +273,14 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
         case attr: AttributeReference =>
           updatedExpression.find { p => p._1.sameRef(attr) } match {
             case Some((_, childAttr)) =>
-              AttributeReference(
+              CarbonToSparkAdapater.createAttributeReference(
                 childAttr.name,
                 childAttr.dataType,
                 childAttr.nullable,
-                childAttr.metadata)(childAttr.exprId, attr.qualifier, attr.isGenerated)
+                childAttr.metadata,
+                childAttr.exprId,
+                attr.qualifier,
+                attr)
             case None =>
               attr
           }
@@ -294,11 +299,14 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
         case attr: AttributeReference =>
           updatedExpression.find { p => p._1.sameRef(attr) } match {
             case Some((_, childAttr)) =>
-              AttributeReference(
+              CarbonToSparkAdapater.createAttributeReference(
                 childAttr.name,
                 childAttr.dataType,
                 childAttr.nullable,
-                childAttr.metadata)(childAttr.exprId, attr.qualifier, attr.isGenerated)
+                childAttr.metadata,
+                childAttr.exprId,
+                attr.qualifier,
+                attr)
             case None =>
               attr
           }
@@ -359,7 +367,7 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
            l.relation.asInstanceOf[CarbonDatasourceHadoopRelation].carbonRelation.
              metaData.hasAggregateDataMapSchema && !isPlanUpdated =>
         val carbonTable = getCarbonTable(l)
-        if(isSpecificSegmentNotPresent(carbonTable)) {
+        if (isSpecificSegmentNotPresent(carbonTable)) {
           val list = scala.collection.mutable.HashSet.empty[QueryColumn]
           val aggregateExpressions = scala.collection.mutable.HashSet.empty[AggregateExpression]
           val isValidPlan = extractQueryColumnsFromAggExpression(
@@ -386,6 +394,7 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
                   carbonTable,
                   agg)
               isPlanUpdated = true
+              setExplain(aggDataMapSchema)
               val updateAggPlan =
                 Aggregate(
                 updatedGroupExp,
@@ -451,6 +460,7 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
                   carbonTable,
                   agg)
               isPlanUpdated = true
+              setExplain(aggDataMapSchema)
               val updateAggPlan =
                 Aggregate(
                 updatedGroupExp,
@@ -519,6 +529,7 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
                   carbonTable,
                   agg)
               isPlanUpdated = true
+              setExplain(aggDataMapSchema)
               val updateAggPlan =
                 Aggregate(
                 updatedGroupExp,
@@ -590,6 +601,7 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
                   carbonTable,
                   agg)
               isPlanUpdated = true
+              setExplain(aggDataMapSchema)
               val updateAggPlan =
                 Aggregate(
                   updatedGroupExp,
@@ -624,10 +636,15 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
 
     }
     if(isPlanUpdated) {
-      CarbonSession.threadSet(CarbonCommonConstants.SUPPORT_DIRECT_QUERY_ON_DATAMAP,
-        "true")
+      CarbonSession.threadSet(CarbonCommonConstants.SUPPORT_DIRECT_QUERY_ON_DATAMAP, "true")
     }
     updatedPlan
+  }
+
+  // set datamap match information for EXPLAIN command
+  private def setExplain(dataMapSchema: AggregationDataMapSchema): Unit = {
+    ExplainCollector.recordMatchedOlapDataMap(
+      dataMapSchema.getProvider.getShortName, dataMapSchema.getDataMapName)
   }
 
   /**
@@ -653,7 +670,7 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
       aggregationDataMapSchema: DataMapSchema,
       factAggPlan: LogicalPlan): LogicalPlan = {
     // to handle streaming table with pre aggregate
-    if (carbonTable.isStreamingTable) {
+    if (carbonTable.isStreamingSink) {
       setSegmentsForStreaming(carbonTable, aggregationDataMapSchema)
       // get new fact expression
       val factExp = updateFactTablePlanForStreaming(factAggPlan)
@@ -766,24 +783,36 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
         val factAlias = factPlanExpForStreaming(name)
         // create attribute reference object for each expression
         val attrs = factAlias.map { factAlias =>
-          AttributeReference(
+          CarbonToSparkAdapater.createAttributeReference(
             name,
             alias.dataType,
-            alias.nullable) (factAlias.exprId, alias.qualifier, alias.isGenerated)
+            alias.nullable,
+            Metadata.empty,
+            factAlias.exprId,
+            alias.qualifier,
+            alias)
         }
         // add aggregate function in Aggregate node added for handling streaming
         // to aggregate results from fact and aggregate table
         val updatedAggExp = getAggregateExpressionForAggregation(aggExp, attrs)
         // same reference id will be used as it can be used by above nodes in the plan like
         // sort, project, join
-        Alias(
+        CarbonToSparkAdapater.createAliasRef(
           updatedAggExp.head,
-          name)(alias.exprId, alias.qualifier, Option(alias.metadata), alias.isGenerated)
+          name,
+          alias.exprId,
+          alias.qualifier,
+          Option(alias.metadata),
+          Some(alias))
       case alias@Alias(expression, name) =>
-        AttributeReference(
+        CarbonToSparkAdapater.createAttributeReference(
           name,
           alias.dataType,
-          alias.nullable) (alias.exprId, alias.qualifier, alias.isGenerated)
+          alias.nullable,
+          Metadata.empty,
+          alias.exprId,
+          alias.qualifier,
+          alias)
     }
     updatedExp
   }
@@ -886,9 +915,10 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
           case attr: AttributeReference =>
             newAggExp += attr
           case exp: Expression =>
-            newAggExp += Alias(
+            newAggExp += CarbonToSparkAdapater.createAliasRef(
               exp,
-              "dummy_" + counter)(NamedExpression.newExprId, None, None, false)
+              "dummy_" + counter,
+              NamedExpression.newExprId)
             counter = counter + 1
         }
       }
@@ -912,12 +942,12 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
         // get the new aggregate expression
         val newAggExp = getAggFunctionForFactStreaming(aggExp)
         val updatedExp = newAggExp.map { exp =>
-          Alias(exp,
-              name)(
-              NamedExpression.newExprId,
-              alias.qualifier,
+          CarbonToSparkAdapater.createAliasRef(exp,
+            name,
+            NamedExpression.newExprId,
+            alias.qualifier,
             Some(alias.metadata),
-              alias.isGenerated)
+            Some(alias))
         }
         // adding to map which will be used while Adding an Aggregate node for handling streaming
         // table plan change
@@ -925,10 +955,13 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
         updatedExp
       case alias@Alias(exp: Expression, name) =>
         val newAlias = Seq(alias)
-        val attr = AttributeReference(name,
-            alias.dataType,
-            alias.nullable,
-            alias.metadata) (alias.exprId, alias.qualifier, alias.isGenerated)
+        val attr = CarbonToSparkAdapater.createAttributeReference(name,
+          alias.dataType,
+          alias.nullable,
+          alias.metadata,
+          alias.exprId,
+          alias.qualifier,
+          alias)
         factPlanGrpExpForStreaming.put(
           AggExpToColumnMappingModel(
             removeQualifiers(PreAggregateUtil.normalizeExprId(exp, plan.allAttributes))),
@@ -1004,7 +1037,7 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
     // if it does not match with any pre aggregate table return the same plan
     if (!selectedAggMaps.isEmpty) {
       // filter the selected child schema based on size to select the pre-aggregate tables
-      // that are nonEmpty
+      // that are enabled
       val catalog = CarbonEnv.getInstance(sparkSession).carbonMetastore
       val relationBuffer = selectedAggMaps.asScala.map { selectedDataMapSchema =>
         val identifier = TableIdentifier(
@@ -1041,7 +1074,7 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
             .apply(logicalPlan))
           case None => (null, null)
         }
-        // If the relationBuffer is nonEmpty then find the table with the minimum size.
+        // If the relationBuffer is enabled then find the table with the minimum size.
       }
     } else {
       (null, null)
@@ -1082,11 +1115,14 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
   private def removeQualifiers(expression: Expression) : Expression = {
     expression.transform {
       case attr: AttributeReference =>
-        AttributeReference(
+        CarbonToSparkAdapater.createAttributeReference(
           attr.name,
           attr.dataType,
           attr.nullable,
-          attr.metadata)(attr.exprId, None, attr.isGenerated)
+          attr.metadata,
+          attr.exprId,
+          None,
+          attr)
     }
   }
 
@@ -1352,10 +1388,13 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
           attr,
           attributes)
         val newExpressionId = NamedExpression.newExprId
-        val childTableAttr = AttributeReference(attr.name,
+        val childTableAttr = CarbonToSparkAdapater.createAttributeReference(attr.name,
           childAttr.dataType,
           childAttr.nullable,
-          childAttr.metadata)(newExpressionId, childAttr.qualifier, attr.isGenerated)
+          childAttr.metadata,
+          newExpressionId,
+          childAttr.qualifier,
+          attr)
         updatedExpression.put(attr, childTableAttr)
         // returning the alias to show proper column name in output
         Seq(Alias(childAttr,
@@ -1367,12 +1406,20 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
           attr,
           attributes)
         val newExpressionId = NamedExpression.newExprId
-        val parentTableAttr = AttributeReference(name,
+        val parentTableAttr = CarbonToSparkAdapater.createAttributeReference(name,
           alias.dataType,
-          alias.nullable) (alias.exprId, alias.qualifier, alias.isGenerated)
-        val childTableAttr = AttributeReference(name,
+          alias.nullable,
+          Metadata.empty,
+          alias.exprId,
+          alias.qualifier,
+          alias)
+        val childTableAttr = CarbonToSparkAdapater.createAttributeReference(name,
           alias.dataType,
-          alias.nullable) (newExpressionId, alias.qualifier, alias.isGenerated)
+          alias.nullable,
+          Metadata.empty,
+          newExpressionId,
+          alias.qualifier,
+          alias)
         updatedExpression.put(parentTableAttr, childTableAttr)
         // returning alias with child attribute reference
         Seq(Alias(childAttr,
@@ -1388,23 +1435,31 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
             parentTable,
             parentLogicalPlan,
             aggExpColumnMapping.get,
-            parentTable.isStreamingTable)
+            parentTable.isStreamingSink)
         } else {
           Seq(attr)
         }
-        if(!parentTable.isStreamingTable) {
+        if(!parentTable.isStreamingSink) {
           // for normal table
           // generate new expression id for child
           val newExpressionId = NamedExpression.newExprId
           // create a parent attribute reference which will be replced on node which may be referred
           // by node like sort join
-          val parentTableAttr = AttributeReference(name,
+          val parentTableAttr = CarbonToSparkAdapater.createAttributeReference(name,
             alias.dataType,
-            alias.nullable)(alias.exprId, alias.qualifier, alias.isGenerated)
+            alias.nullable,
+            Metadata.empty,
+            alias.exprId,
+            alias.qualifier,
+            alias)
           // creating a child attribute reference which will be replced
-          val childTableAttr = AttributeReference(name,
+          val childTableAttr = CarbonToSparkAdapater.createAttributeReference(name,
             alias.dataType,
-            alias.nullable)(newExpressionId, alias.qualifier, alias.isGenerated)
+            alias.nullable,
+            Metadata.empty,
+            newExpressionId,
+            alias.qualifier,
+            alias)
           // adding to map, will be used during other node updation like sort, join, project
           updatedExpression.put(parentTableAttr, childTableAttr)
           // returning alias with child attribute reference
@@ -1415,12 +1470,12 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
           // for streaming table
           // create alias for aggregate table
           val aggExpForStreaming = aggExp.map{ exp =>
-            Alias(exp,
-              name)(
+            CarbonToSparkAdapater.createAliasRef(exp,
+              name,
               NamedExpression.newExprId,
               alias.qualifier,
               Some(alias.metadata),
-              alias.isGenerated).asInstanceOf[NamedExpression]
+              Some(alias)).asInstanceOf[NamedExpression]
           }
           aggExpForStreaming
         }
@@ -1449,12 +1504,20 @@ case class CarbonPreAggregateQueryRules(sparkSession: SparkSession) extends Rule
             }
           }
         val newExpressionId = NamedExpression.newExprId
-        val parentTableAttr = AttributeReference(name,
+        val parentTableAttr = CarbonToSparkAdapater.createAttributeReference(name,
           alias.dataType,
-          alias.nullable) (alias.exprId, alias.qualifier, alias.isGenerated)
-        val childTableAttr = AttributeReference(name,
+          alias.nullable,
+          Metadata.empty,
+          alias.exprId,
+          alias.qualifier,
+          alias)
+        val childTableAttr = CarbonToSparkAdapater.createAttributeReference(name,
           alias.dataType,
-          alias.nullable) (newExpressionId, alias.qualifier, alias.isGenerated)
+          alias.nullable,
+          Metadata.empty,
+          newExpressionId,
+          alias.qualifier,
+          alias)
         updatedExpression.put(parentTableAttr, childTableAttr)
         Seq(Alias(updatedExp, name)(newExpressionId,
           alias.qualifier).asInstanceOf[NamedExpression])
@@ -1776,20 +1839,23 @@ case class CarbonPreAggregateDataLoadingRules(sparkSession: SparkSession)
               // named expression list otherwise update the list and add it to set
               if (!validExpressionsMap.contains(AggExpToColumnMappingModel(sumExp))) {
                 namedExpressionList +=
-                Alias(expressions.head, name + "_ sum")(NamedExpression.newExprId,
+                CarbonToSparkAdapater.createAliasRef(expressions.head,
+                  name + "_ sum",
+                  NamedExpression.newExprId,
                   alias.qualifier,
                   Some(alias.metadata),
-                  alias.isGenerated)
+                  Some(alias))
                 validExpressionsMap += AggExpToColumnMappingModel(sumExp)
               }
               // check with same expression already count is present then do not add to
               // named expression list otherwise update the list and add it to set
               if (!validExpressionsMap.contains(AggExpToColumnMappingModel(countExp))) {
                 namedExpressionList +=
-                Alias(expressions.last, name + "_ count")(NamedExpression.newExprId,
-                  alias.qualifier,
-                  Some(alias.metadata),
-                  alias.isGenerated)
+                CarbonToSparkAdapater.createAliasRef(expressions.last, name + "_ count",
+                    NamedExpression.newExprId,
+                    alias.qualifier,
+                    Some(alias.metadata),
+                    Some(alias))
                 validExpressionsMap += AggExpToColumnMappingModel(countExp)
               }
             } else {

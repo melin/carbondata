@@ -30,20 +30,21 @@ import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.{CodegenSupport, SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.optimizer.CarbonDecoderRelation
 import org.apache.spark.sql.types._
-import org.apache.spark.util.SparkTypeConverter
+import org.apache.spark.sql.util.SparkTypeConverter
 
 import org.apache.carbondata.core.cache.{Cache, CacheProvider, CacheType}
 import org.apache.carbondata.core.cache.dictionary.{Dictionary, DictionaryColumnUniqueIdentifier}
 import org.apache.carbondata.core.constants.CarbonCommonConstants
-import org.apache.carbondata.core.metadata.ColumnIdentifier
+import org.apache.carbondata.core.metadata.{CarbonMetadata, ColumnIdentifier}
 import org.apache.carbondata.core.metadata.datatype.{DataTypes => CarbonDataTypes}
 import org.apache.carbondata.core.metadata.encoder.Encoding
 import org.apache.carbondata.core.metadata.schema.table.CarbonTable
 import org.apache.carbondata.core.metadata.schema.table.column.CarbonDimension
 import org.apache.carbondata.core.scan.executor.util.QueryUtil
-import org.apache.carbondata.core.util.DataTypeUtil
+import org.apache.carbondata.core.util.{DataTypeUtil, ThreadLocalSessionInfo}
+import org.apache.carbondata.hadoop.util.CarbonInputFormatUtil
 import org.apache.carbondata.spark.CarbonAliasDecoderRelation
-import org.apache.carbondata.spark.rdd.CarbonRDDWithTableInfo
+import org.apache.carbondata.spark.rdd.{CarbonRDDWithTableInfo, SerializableConfiguration}
 
 /**
  * It decodes the data.
@@ -75,9 +76,12 @@ case class CarbonDictionaryDecoder(
         (carbonTable.getTableName, carbonTable)
       }.toMap
 
+      val conf = sparkSession.sparkContext.broadcast(new SerializableConfiguration(sparkSession
+        .sessionState.newHadoopConf()))
       if (CarbonDictionaryDecoder.isRequiredToDecode(getDictionaryColumnIds)) {
         val dataTypes = child.output.map { attr => attr.dataType }
         child.execute().mapPartitions { iter =>
+          ThreadLocalSessionInfo.setConfigurationToCurrentThread(conf.value.value)
           val cacheProvider: CacheProvider = CacheProvider.getInstance
           val forwardDictionaryCache: Cache[DictionaryColumnUniqueIdentifier, Dictionary] =
             cacheProvider.createCache(CacheType.FORWARD_DICTIONARY)
@@ -275,9 +279,13 @@ case class CarbonDictionaryDecoder(
               if (null != carbonDimension.getColumnSchema.getParentColumnTableRelations &&
                   !carbonDimension
                     .getColumnSchema.getParentColumnTableRelations.isEmpty) {
+                val parentRelationIdentifier = carbonDimension.getColumnSchema
+                  .getParentColumnTableRelations.get(0).getRelationIdentifier
+                val parentTablePath = CarbonMetadata.getInstance()
+                  .getCarbonTable(parentRelationIdentifier.getDatabaseName,
+                    parentRelationIdentifier.getTableName).getTablePath
                 (QueryUtil
-                  .getTableIdentifierForColumn(carbonDimension,
-                    atiMap(tableName).getAbsoluteTableIdentifier),
+                  .getTableIdentifierForColumn(carbonDimension),
                   new ColumnIdentifier(carbonDimension.getColumnSchema
                     .getParentColumnTableRelations.get(0).getColumnId,
                     carbonDimension.getColumnProperties,
@@ -435,7 +443,9 @@ class CarbonDecoderRDD(
     val prev: RDD[InternalRow],
     output: Seq[Attribute],
     serializedTableInfo: Array[Byte])
-  extends CarbonRDDWithTableInfo[InternalRow](prev, serializedTableInfo) {
+  extends CarbonRDDWithTableInfo[InternalRow](relations.head.carbonRelation.sparkSession,
+    prev,
+    serializedTableInfo) {
 
   def canBeDecoded(attr: Attribute): Boolean = {
     profile match {
@@ -539,7 +549,8 @@ class CarbonDecoderRDD(
     dicts
   }
 
-  override protected def getPartitions: Array[Partition] = firstParent[InternalRow].partitions
+  override protected def internalGetPartitions: Array[Partition] =
+    firstParent[InternalRow].partitions
 }
 
 /**

@@ -25,8 +25,8 @@ import org.apache.carbondata.core.datastore.exception.CarbonDataWriterException;
 import org.apache.carbondata.core.datastore.row.CarbonRow;
 import org.apache.carbondata.core.datastore.row.WriteStepRowUtil;
 import org.apache.carbondata.core.metadata.schema.table.CarbonTable;
+import org.apache.carbondata.core.metadata.schema.table.column.CarbonColumn;
 import org.apache.carbondata.processing.loading.model.CarbonLoadModel;
-import org.apache.carbondata.processing.partition.spliter.exception.AlterPartitionSliceException;
 import org.apache.carbondata.processing.store.CarbonDataFileAttributes;
 import org.apache.carbondata.processing.store.CarbonFactDataHandlerColumnar;
 import org.apache.carbondata.processing.store.CarbonFactDataHandlerModel;
@@ -37,6 +37,8 @@ public class RowResultProcessor {
 
   private CarbonFactHandler dataHandler;
   private SegmentProperties segmentProperties;
+
+  private CarbonColumn[] noDicAndComplexColumns;
 
   private static final LogService LOGGER =
       LogServiceFactory.getLogService(RowResultProcessor.class.getName());
@@ -59,6 +61,8 @@ public class RowResultProcessor {
     carbonFactDataHandlerModel.setBucketId(bucketId);
     //Note: set compaction flow just to convert decimal type
     carbonFactDataHandlerModel.setCompactionFlow(true);
+    carbonFactDataHandlerModel.setSegmentId(loadModel.getSegmentId());
+    noDicAndComplexColumns = carbonFactDataHandlerModel.getNoDictAndComplexColumns();
     dataHandler = new CarbonFactDataHandlerColumnar(carbonFactDataHandlerModel);
   }
 
@@ -79,7 +83,7 @@ public class RowResultProcessor {
         this.dataHandler.finish();
       }
       processStatus = true;
-    } catch (AlterPartitionSliceException e) {
+    } catch (CarbonDataWriterException e) {
       LOGGER.error(e, e.getMessage());
       LOGGER.error("Exception in executing RowResultProcessor" + e.getMessage());
       processStatus = false;
@@ -96,12 +100,13 @@ public class RowResultProcessor {
     return processStatus;
   }
 
-  private void addRow(Object[] carbonTuple) throws AlterPartitionSliceException {
-    CarbonRow row = WriteStepRowUtil.fromMergerRow(carbonTuple, segmentProperties);
+  private void addRow(Object[] carbonTuple) throws CarbonDataWriterException {
+    CarbonRow row = WriteStepRowUtil.fromMergerRow(carbonTuple, segmentProperties,
+        noDicAndComplexColumns);
     try {
       this.dataHandler.addDataToStore(row);
     } catch (CarbonDataWriterException e) {
-      throw new AlterPartitionSliceException("Exception in adding rows in RowResultProcessor", e);
+      throw new CarbonDataWriterException("Exception in adding rows in RowResultProcessor", e);
     }
   }
 }

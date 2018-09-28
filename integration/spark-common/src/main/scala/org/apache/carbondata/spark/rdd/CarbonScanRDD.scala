@@ -38,10 +38,13 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.profiler.{GetPartition, Profiler, QueryTaskEnd}
 import org.apache.spark.sql.util.SparkSQLUtil.sessionState
+import org.apache.spark.util.{CarbonReflectionUtils, TaskCompletionListener}
 
 import org.apache.carbondata.common.logging.LogServiceFactory
+import org.apache.carbondata.converter.SparkDataTypeConverterImpl
 import org.apache.carbondata.core.constants.{CarbonCommonConstants, CarbonCommonConstantsInternal}
 import org.apache.carbondata.core.datastore.block.Distributable
+import org.apache.carbondata.core.datastore.impl.FileFactory
 import org.apache.carbondata.core.indexstore.PartitionSpec
 import org.apache.carbondata.core.metadata.AbsoluteTableIdentifier
 import org.apache.carbondata.core.metadata.schema.table.TableInfo
@@ -55,10 +58,11 @@ import org.apache.carbondata.hadoop._
 import org.apache.carbondata.hadoop.api.{CarbonFileInputFormat, CarbonInputFormat}
 import org.apache.carbondata.hadoop.api.CarbonTableInputFormat
 import org.apache.carbondata.hadoop.readsupport.CarbonReadSupport
+import org.apache.carbondata.hadoop.util.CarbonInputFormatUtil
 import org.apache.carbondata.processing.util.CarbonLoaderUtil
 import org.apache.carbondata.spark.InitInputMetrics
-import org.apache.carbondata.spark.util.{SparkDataTypeConverterImpl, Util}
-import org.apache.carbondata.streaming.{CarbonStreamInputFormat, CarbonStreamRecordReader}
+import org.apache.carbondata.spark.util.Util
+import org.apache.carbondata.streaming.CarbonStreamInputFormat
 
 /**
  * This RDD is used to perform query on CarbonData file. Before sending tasks to scan
@@ -66,17 +70,17 @@ import org.apache.carbondata.streaming.{CarbonStreamInputFormat, CarbonStreamRec
  * level filtering in driver side.
  */
 class CarbonScanRDD[T: ClassTag](
-    @transient spark: SparkSession,
+    @transient private val spark: SparkSession,
     val columnProjection: CarbonProjection,
     var filterExpression: Expression,
     identifier: AbsoluteTableIdentifier,
-    @transient serializedTableInfo: Array[Byte],
-    @transient tableInfo: TableInfo,
+    @transient private val serializedTableInfo: Array[Byte],
+    @transient private val tableInfo: TableInfo,
     inputMetricsStats: InitInputMetrics,
     @transient val partitionNames: Seq[PartitionSpec],
     val dataTypeConverterClz: Class[_ <: DataTypeConverter] = classOf[SparkDataTypeConverterImpl],
     val readSupportClz: Class[_ <: CarbonReadSupport[_]] = SparkReadSupport.readSupportClass)
-  extends CarbonRDDWithTableInfo[T](spark.sparkContext, Nil, serializedTableInfo) {
+  extends CarbonRDDWithTableInfo[T](spark, Nil, serializedTableInfo) {
 
   private val queryId = sparkContext.getConf.get("queryId", System.nanoTime() + "")
   private val jobTrackerId: String = {
@@ -89,7 +93,7 @@ class CarbonScanRDD[T: ClassTag](
 
   @transient val LOGGER = LogServiceFactory.getLogService(this.getClass.getName)
 
-  override def getPartitions: Array[Partition] = {
+  override def internalGetPartitions: Array[Partition] = {
     val startTime = System.currentTimeMillis()
     var partitions: Array[Partition] = Array.empty[Partition]
     var getSplitsStartTime: Long = -1
@@ -102,7 +106,7 @@ class CarbonScanRDD[T: ClassTag](
     var numBlocks = 0
 
     try {
-      val conf = new Configuration()
+      val conf = FileFactory.getConfiguration
       val jobConf = new JobConf(conf)
       SparkHadoopUtil.get.addCredentials(jobConf)
       val job = Job.getInstance(jobConf)
@@ -161,14 +165,18 @@ class CarbonScanRDD[T: ClassTag](
         if (batchPartitions.isEmpty) {
           partitions = streamPartitions.toArray
         } else {
-          logInfo(
-            s"""
-               | Identified no.of Streaming Blocks: ${ streamPartitions.size },
-          """.stripMargin)
           // should keep the order by index of partition
           batchPartitions.appendAll(streamPartitions)
           partitions = batchPartitions.toArray
         }
+        logInfo(
+          s"""
+             | Identified no.of.streaming splits/tasks: ${ streamPartitions.size },
+             | no.of.streaming files: ${format.getHitedStreamFiles},
+             | no.of.total streaming files: ${format.getNumStreamFiles},
+             | no.of.total streaming segement: ${format.getNumStreamSegments}
+          """.stripMargin)
+
       }
       partitions
     } finally {
@@ -402,7 +410,7 @@ class CarbonScanRDD[T: ClassTag](
     val executionId = context.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
     val taskId = split.index
     val attemptId = new TaskAttemptID(jobTrackerId, id, TaskType.MAP, split.index, 0)
-    val attemptContext = new TaskAttemptContextImpl(new Configuration(), attemptId)
+    val attemptContext = new TaskAttemptContextImpl(FileFactory.getConfiguration, attemptId)
     val format = prepareInputFormatForExecutor(attemptContext.getConfiguration)
     val inputSplit = split.asInstanceOf[CarbonSparkPartition].split.value
     TaskMetricsMap.getInstance().registerThreadCallback()
@@ -417,13 +425,13 @@ class CarbonScanRDD[T: ClassTag](
           // create record reader for row format
           DataTypeUtil.setDataTypeConverter(dataTypeConverterClz.newInstance())
           val inputFormat = new CarbonStreamInputFormat
-          val streamReader = inputFormat.createRecordReader(inputSplit, attemptContext)
-            .asInstanceOf[CarbonStreamRecordReader]
-          streamReader.setVectorReader(vectorReader)
-          streamReader.setInputMetricsStats(inputMetricsStats)
+          inputFormat.setIsVectorReader(vectorReader)
+          inputFormat.setInputMetricsStats(inputMetricsStats)
           model.setStatisticsRecorder(
             CarbonTimeStatisticsFactory.createExecutorRecorder(model.getQueryId))
-          streamReader.setQueryModel(model)
+          inputFormat.setModel(model)
+          val streamReader = inputFormat.createRecordReader(inputSplit, attemptContext)
+            .asInstanceOf[RecordReader[Void, Object]]
           streamReader
         case _ =>
           // create record reader for CarbonData file format
@@ -433,14 +441,16 @@ class CarbonScanRDD[T: ClassTag](
               "true")
             if (carbonRecordReader == null) {
               new CarbonRecordReader(model,
-                format.getReadSupportClass(attemptContext.getConfiguration), inputMetricsStats)
+                format.getReadSupportClass(attemptContext.getConfiguration),
+                inputMetricsStats,
+                attemptContext.getConfiguration)
             } else {
               carbonRecordReader
             }
           } else {
             new CarbonRecordReader(model,
               format.getReadSupportClass(attemptContext.getConfiguration),
-              inputMetricsStats)
+              inputMetricsStats, attemptContext.getConfiguration)
           }
       }
 
@@ -450,19 +460,37 @@ class CarbonScanRDD[T: ClassTag](
             reader.close()
           } catch {
             case e: Exception =>
-              LOGGER.error(e)
+              LogServiceFactory.getLogService(this.getClass.getCanonicalName).error(e)
           }
           reader = null
         }
       }
 
+      // create a statistics recorder
+      val recorder = CarbonTimeStatisticsFactory.createExecutorRecorder(model.getQueryId())
+      model.setStatisticsRecorder(recorder)
+
+      // TODO: rewrite this logic to call free memory in FailureListener on failures. On success,
+      // TODO: no memory leak should be there, resources should be freed on success completion.
+      val onCompleteCallbacksField = context.getClass.getDeclaredField("onCompleteCallbacks")
+      onCompleteCallbacksField.setAccessible(true)
+      val listeners = onCompleteCallbacksField.get(context)
+        .asInstanceOf[ArrayBuffer[TaskCompletionListener]]
+
+      val isAdded = listeners.exists(p => p.isInstanceOf[InsertTaskCompletionListener])
+      model.setFreeUnsafeMemory(!isAdded)
       // add task completion before calling initialize as initialize method will internally call
       // for usage of unsafe method for processing of one blocklet and if there is any exception
       // while doing that the unsafe memory occupied for that task will not get cleared
-      context.addTaskCompletionListener { _ =>
-        closeReader.apply()
-        close()
-        logStatistics(executionId, taskId, queryStartTime, model.getStatisticsRecorder, split)
+      context.addTaskCompletionListener { new QueryTaskCompletionListener(!isAdded,
+        reader,
+        inputMetricsStats,
+        executionId,
+        taskId,
+        queryStartTime,
+        model.getStatisticsRecorder,
+        split,
+        queryId)
       }
       // initialize the reader
       reader.initialize(inputSplit, attemptContext)
@@ -550,12 +578,7 @@ class CarbonScanRDD[T: ClassTag](
     CarbonInputFormat.setQuerySegment(conf, identifier)
     CarbonInputFormat.setFilterPredicates(conf, filterExpression)
     CarbonInputFormat.setColumnProjection(conf, columnProjection)
-    CarbonInputFormat.setDataMapJob(conf, new SparkDataMapJob)
-    if (CarbonProperties.getInstance().getProperty(
-      CarbonCommonConstants.USE_DISTRIBUTED_DATAMAP,
-      CarbonCommonConstants.USE_DISTRIBUTED_DATAMAP_DEFAULT).toBoolean) {
-      CarbonInputFormat.setDataMapJob(conf, new SparkDataMapJob)
-    }
+    CarbonInputFormatUtil.setDataMapJobIfConfigured(conf)
 
     // when validate segments is disabled in thread local update it to CarbonTableInputFormat
     val carbonSessionInfo = ThreadLocalSessionInfo.getCarbonSessionInfo
@@ -595,12 +618,7 @@ class CarbonScanRDD[T: ClassTag](
     CarbonInputFormat.setQuerySegment(conf, identifier)
     CarbonInputFormat.setFilterPredicates(conf, filterExpression)
     CarbonInputFormat.setColumnProjection(conf, columnProjection)
-    CarbonInputFormat.setDataMapJob(conf, new SparkDataMapJob)
-    if (CarbonProperties.getInstance().getProperty(
-      CarbonCommonConstants.USE_DISTRIBUTED_DATAMAP,
-      CarbonCommonConstants.USE_DISTRIBUTED_DATAMAP_DEFAULT).toBoolean) {
-      CarbonInputFormat.setDataMapJob(conf, new SparkDataMapJob)
-    }
+    CarbonInputFormatUtil.setDataMapJobIfConfigured(conf)
     // when validate segments is disabled in thread local update it to CarbonTableInputFormat
     val carbonSessionInfo = ThreadLocalSessionInfo.getCarbonSessionInfo
     if (carbonSessionInfo != null) {
@@ -629,43 +647,6 @@ class CarbonScanRDD[T: ClassTag](
       }
     }
     format
-  }
-
-  def logStatistics(
-      executionId: String,
-      taskId: Long,
-      queryStartTime: Long,
-      recorder: QueryStatisticsRecorder,
-      split: Partition
-  ): Unit = {
-    if (null != recorder) {
-      val queryStatistic = new QueryStatistic()
-      queryStatistic.addFixedTimeStatistic(QueryStatisticsConstants.EXECUTOR_PART,
-        System.currentTimeMillis - queryStartTime)
-      recorder.recordStatistics(queryStatistic)
-      // print executor query statistics for each task_id
-      val statistics = recorder.statisticsForTask(taskId, queryStartTime)
-      if (statistics != null && executionId != null) {
-        Profiler.invokeIfEnable {
-          val inputSplit = split.asInstanceOf[CarbonSparkPartition].split.value
-          inputSplit.calculateLength()
-          val size = inputSplit.getLength
-          val files = inputSplit.getAllSplits.asScala.map { s =>
-            s.getSegmentId + "/" + s.getPath.getName
-          }.toArray[String]
-          Profiler.send(
-            QueryTaskEnd(
-              executionId.toLong,
-              queryId,
-              statistics.getValues,
-              size,
-              files
-            )
-          )
-        }
-      }
-      recorder.logStatisticsForTask(statistics)
-    }
   }
 
   /**

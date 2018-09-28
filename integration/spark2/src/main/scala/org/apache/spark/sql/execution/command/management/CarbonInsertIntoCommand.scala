@@ -18,15 +18,13 @@
 package org.apache.spark.sql.execution.command.management
 
 import org.apache.spark.sql.{CarbonDatasourceHadoopRelation, Dataset, Row, SparkSession}
-import org.apache.spark.sql.catalyst.encoders.RowEncoder
 import org.apache.spark.sql.catalyst.plans.logical.{GlobalLimit, LogicalPlan}
 import org.apache.spark.sql.execution.command.{AtomicRunnableCommand, DataCommand}
 import org.apache.spark.storage.StorageLevel
 
 import org.apache.carbondata.common.logging.{LogService, LogServiceFactory}
 import org.apache.carbondata.core.constants.CarbonCommonConstants
-import org.apache.carbondata.core.util.CarbonProperties
-import org.apache.carbondata.spark.util.CarbonSparkUtil
+import org.apache.carbondata.core.util.{CarbonProperties, ThreadLocalSessionInfo}
 
 case class CarbonInsertIntoCommand(
     relation: CarbonDatasourceHadoopRelation,
@@ -45,6 +43,9 @@ case class CarbonInsertIntoCommand(
         case other => false
       } isDefined
     }
+
+    ThreadLocalSessionInfo
+      .setConfigurationToCurrentThread(sparkSession.sessionState.newHadoopConf())
     val isPersistEnabledUserValue = CarbonProperties.getInstance
       .getProperty(CarbonCommonConstants.CARBON_INSERT_PERSIST_ENABLED,
         CarbonCommonConstants.CARBON_INSERT_PERSIST_ENABLED_DEFAULT)
@@ -53,8 +54,9 @@ case class CarbonInsertIntoCommand(
     val df =
       if (isPersistRequired) {
         LOGGER.info("Persist enabled for Insert operation")
-        Dataset.ofRows(sparkSession, child)
-          .persist(StorageLevel.MEMORY_AND_DISK)
+        Dataset.ofRows(sparkSession, child).persist(
+          StorageLevel.fromString(
+            CarbonProperties.getInstance.getInsertIntoDatasetStorageLevel))
       } else {
         Dataset.ofRows(sparkSession, child)
       }

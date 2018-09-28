@@ -31,14 +31,18 @@ import org.apache.carbondata.core.scan.model.QueryModel;
 import org.apache.carbondata.core.scan.result.iterator.SearchModeResultIterator;
 import org.apache.carbondata.core.util.CarbonProperties;
 
+import org.apache.hadoop.conf.Configuration;
 
 public class SearchModeDetailQueryExecutor extends AbstractQueryExecutor<Object> {
   private static final LogService LOGGER =
           LogServiceFactory.getLogService(SearchModeDetailQueryExecutor.class.getName());
   private static ExecutorService executorService = null;
 
-  static {
-    initThreadPool();
+  public SearchModeDetailQueryExecutor(Configuration configuration) {
+    super(configuration);
+    if (executorService == null) {
+      initThreadPool();
+    }
   }
 
   private static synchronized void initThreadPool() {
@@ -70,9 +74,7 @@ public class SearchModeDetailQueryExecutor extends AbstractQueryExecutor<Object>
   public CarbonIterator<Object> execute(QueryModel queryModel)
       throws QueryExecutionException, IOException {
     List<BlockExecutionInfo> blockExecutionInfoList = getBlockExecutionInfos(queryModel);
-    if (executorService == null) {
-      initThreadPool();
-    }
+
     this.queryIterator = new SearchModeResultIterator(
         blockExecutionInfoList,
         queryModel,

@@ -35,8 +35,8 @@ import org.apache.carbondata.common.logging.LogServiceFactory;
 import org.apache.carbondata.core.constants.CarbonCommonConstants;
 import org.apache.carbondata.core.datamap.Segment;
 import org.apache.carbondata.core.datastore.impl.FileFactory;
+import org.apache.carbondata.core.fileoperations.AtomicFileOperationFactory;
 import org.apache.carbondata.core.fileoperations.AtomicFileOperations;
-import org.apache.carbondata.core.fileoperations.AtomicFileOperationsImpl;
 import org.apache.carbondata.core.fileoperations.FileWriteOperation;
 import org.apache.carbondata.core.indexstore.PartitionSpec;
 import org.apache.carbondata.core.locks.CarbonLockFactory;
@@ -55,6 +55,7 @@ import org.apache.carbondata.core.util.DeleteLoadFolders;
 import org.apache.carbondata.core.util.path.CarbonTablePath;
 
 import com.google.gson.Gson;
+import org.apache.hadoop.conf.Configuration;
 
 /**
  * Manages Load/Segment status
@@ -66,8 +67,16 @@ public class SegmentStatusManager {
 
   private AbsoluteTableIdentifier identifier;
 
+  private Configuration configuration;
+
   public SegmentStatusManager(AbsoluteTableIdentifier identifier) {
     this.identifier = identifier;
+    configuration = FileFactory.getConfiguration();
+  }
+
+  public SegmentStatusManager(AbsoluteTableIdentifier identifier, Configuration configuration) {
+    this.identifier = identifier;
+    this.configuration = configuration;
   }
 
   /**
@@ -93,19 +102,8 @@ public class SegmentStatusManager {
     }
   }
 
-  /**
-   * get valid segment for given table
-   *
-   * @return
-   * @throws IOException
-   */
   public ValidAndInvalidSegmentsInfo getValidAndInvalidSegments() throws IOException {
     return getValidAndInvalidSegments(null, null);
-  }
-
-  public ValidAndInvalidSegmentsInfo getValidAndInvalidSegments(
-      LoadMetadataDetails[] loadMetadataDetails) throws IOException {
-    return getValidAndInvalidSegments(loadMetadataDetails, null);
   }
 
   /**
@@ -129,7 +127,8 @@ public class SegmentStatusManager {
       }
 
       if (readCommittedScope == null) {
-        readCommittedScope = new TableStatusReadCommittedScope(identifier, loadMetadataDetails);
+        readCommittedScope = new TableStatusReadCommittedScope(identifier, loadMetadataDetails,
+            configuration);
       }
       //just directly iterate Array
       for (LoadMetadataDetails segment : loadMetadataDetails) {
@@ -240,7 +239,7 @@ public class SegmentStatusManager {
     InputStreamReader inStream = null;
     LoadMetadataDetails[] listOfLoadFolderDetailsArray;
     AtomicFileOperations fileOperation =
-        new AtomicFileOperationsImpl(tableStatusPath, FileFactory.getFileType(tableStatusPath));
+        AtomicFileOperationFactory.getAtomicFileOperations(tableStatusPath);
 
     try {
       if (!FileFactory.isFileExist(tableStatusPath, FileFactory.getFileType(tableStatusPath))) {
@@ -497,7 +496,7 @@ public class SegmentStatusManager {
   public static void writeLoadDetailsIntoFile(String dataLoadLocation,
       LoadMetadataDetails[] listOfLoadFolderDetailsArray) throws IOException {
     AtomicFileOperations fileWrite =
-        new AtomicFileOperationsImpl(dataLoadLocation, FileFactory.getFileType(dataLoadLocation));
+        AtomicFileOperationFactory.getAtomicFileOperations(dataLoadLocation);
     BufferedWriter brWriter = null;
     DataOutputStream dataOutputStream = null;
     Gson gsonObjectToWrite = new Gson();
@@ -512,6 +511,7 @@ public class SegmentStatusManager {
       brWriter.write(metadataInstance);
     } catch (IOException ioe) {
       LOG.error("Error message: " + ioe.getLocalizedMessage());
+      fileWrite.setFailed();
       throw ioe;
     } finally {
       if (null != brWriter) {
@@ -770,6 +770,26 @@ public class SegmentStatusManager {
   }
 
   /**
+   * Return true if the compaction is in progress for the table
+   * @param carbonTable
+   * @return
+   */
+  public static Boolean isCompactionInProgress(CarbonTable carbonTable) {
+    if (carbonTable == null) {
+      return false;
+    }
+    boolean compactionInProgress;
+    ICarbonLock lock = CarbonLockFactory
+        .getCarbonLockObj(carbonTable.getAbsoluteTableIdentifier(), LockUsage.COMPACTION_LOCK);
+    try {
+      compactionInProgress = !lock.lockWithRetries(1, 0);
+    } finally {
+      lock.unlock();
+    }
+    return compactionInProgress;
+  }
+
+  /**
    * Return true if insert overwrite is in progress for specified table
    */
   public static Boolean isOverwriteInProgressInTable(CarbonTable carbonTable) {
@@ -851,7 +871,7 @@ public class SegmentStatusManager {
     BufferedWriter brWriter = null;
 
     AtomicFileOperations writeOperation =
-        new AtomicFileOperationsImpl(dataLoadLocation, FileFactory.getFileType(dataLoadLocation));
+        AtomicFileOperationFactory.getAtomicFileOperations(dataLoadLocation);
 
     try {
 
@@ -861,6 +881,10 @@ public class SegmentStatusManager {
 
       String metadataInstance = gsonObjectToWrite.toJson(listOfLoadFolderDetails.toArray());
       brWriter.write(metadataInstance);
+    } catch (IOException ie) {
+      LOG.error("Error message: " + ie.getLocalizedMessage());
+      writeOperation.setFailed();
+      throw ie;
     } finally {
       try {
         if (null != brWriter) {
@@ -909,6 +933,8 @@ public class SegmentStatusManager {
     CarbonLockUtil.deleteExpiredSegmentLockFiles(carbonTable);
     if (isLoadDeletionRequired(carbonTable.getMetadataPath())) {
       AbsoluteTableIdentifier identifier = carbonTable.getAbsoluteTableIdentifier();
+      boolean updationCompletionStatus = false;
+      LoadMetadataDetails[] newAddedLoadHistoryList = null;
       ReturnTuple tuple = isUpdationRequired(isForceDeletion, carbonTable, identifier);
       if (tuple.isUpdateRequired) {
         ICarbonLock carbonTableStatusLock =
@@ -933,7 +959,6 @@ public class SegmentStatusManager {
             int maxSegmentId = SegmentStatusManager.getMaxSegmentId(tuple2.details);
             int invisibleSegmentCnt = SegmentStatusManager.countInvisibleSegments(
                 tuple2.details, maxSegmentId);
-            LoadMetadataDetails[] newAddedLoadHistoryList = null;
             // if execute command 'clean files' or the number of invisible segment info
             // exceeds the value of 'carbon.invisible.segments.preserve.count',
             // it need to append the invisible segment list to 'tablestatus.history' file.
@@ -958,9 +983,7 @@ public class SegmentStatusManager {
                   updateLoadMetadataFromOldToNew(tuple2.details, latestMetadata);
               writeLoadMetadata(identifier, latestStatus);
             }
-            DeleteLoadFolders.physicalFactAndMeasureMetadataDeletion(
-                identifier, carbonTable.getMetadataPath(),
-                newAddedLoadHistoryList, isForceDeletion, partitionSpecs);
+            updationCompletionStatus = true;
           } else {
             String dbName = identifier.getCarbonTableIdentifier().getDatabaseName();
             String tableName = identifier.getCarbonTableIdentifier().getTableName();
@@ -975,6 +998,11 @@ public class SegmentStatusManager {
         } finally {
           if (locked) {
             CarbonLockUtil.fileUnlock(carbonTableStatusLock, LockUsage.TABLE_STATUS_LOCK);
+          }
+          if (updationCompletionStatus) {
+            DeleteLoadFolders.physicalFactAndMeasureMetadataDeletion(
+                identifier, carbonTable.getMetadataPath(),
+                newAddedLoadHistoryList, isForceDeletion, partitionSpecs);
           }
         }
       }

@@ -23,6 +23,7 @@ import java.util.AbstractQueue;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.PriorityQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
@@ -40,7 +41,6 @@ import org.apache.carbondata.core.util.CarbonProperties;
 import org.apache.carbondata.processing.loading.row.IntermediateSortTempRow;
 import org.apache.carbondata.processing.loading.sort.SortStepRowHandler;
 import org.apache.carbondata.processing.sort.exception.CarbonSortKeyAndGroupByException;
-import org.apache.carbondata.processing.util.CarbonDataProcessorUtil;
 
 public class SingleThreadFinalSortFilesMerger extends CarbonIterator<Object[]> {
   /**
@@ -58,11 +58,6 @@ public class SingleThreadFinalSortFilesMerger extends CarbonIterator<Object[]> {
    * fileCounter
    */
   private int fileCounter;
-
-  /**
-   * fileBufferSize
-   */
-  private int fileBufferSize;
 
   /**
    * recordHolderHeap
@@ -152,15 +147,10 @@ public class SingleThreadFinalSortFilesMerger extends CarbonIterator<Object[]> {
       LOGGER.info("No files to merge sort");
       return;
     }
-    this.fileBufferSize = CarbonDataProcessorUtil
-        .getFileBufferSize(this.fileCounter, CarbonProperties.getInstance(),
-            CarbonCommonConstants.CONSTANT_SIZE_TEN);
 
     LOGGER.info("Started Final Merge");
 
     LOGGER.info("Number of temp file: " + this.fileCounter);
-
-    LOGGER.info("File Buffer Size: " + this.fileBufferSize);
 
     // create record holder heap
     createRecordHolderQueue();
@@ -175,7 +165,7 @@ public class SingleThreadFinalSortFilesMerger extends CarbonIterator<Object[]> {
         @Override public Void call() throws CarbonSortKeyAndGroupByException {
             // create chunk holder
             SortTempFileChunkHolder sortTempFileChunkHolder =
-                new SortTempFileChunkHolder(tempFile, sortParameters, tableName);
+                new SortTempFileChunkHolder(tempFile, sortParameters, tableName, true);
           try {
             // initialize
             sortTempFileChunkHolder.initialize();
@@ -233,8 +223,12 @@ public class SingleThreadFinalSortFilesMerger extends CarbonIterator<Object[]> {
    * @throws CarbonSortKeyAndGroupByException
    */
   public Object[] next() {
-    IntermediateSortTempRow sortTempRow = getSortedRecordFromFile();
-    return sortStepRowHandler.convertIntermediateSortTempRowTo3Parted(sortTempRow);
+    if (hasNext()) {
+      IntermediateSortTempRow sortTempRow = getSortedRecordFromFile();
+      return sortStepRowHandler.convertIntermediateSortTempRowTo3Parted(sortTempRow);
+    } else {
+      throw new NoSuchElementException("No more elements to return");
+    }
   }
 
   /**

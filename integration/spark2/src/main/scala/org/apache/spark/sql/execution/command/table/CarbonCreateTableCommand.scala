@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.command.table
 
 import scala.collection.JavaConverters._
 
+import org.apache.commons.lang3.StringUtils
 import org.apache.spark.sql.{CarbonEnv, Row, SparkSession, _}
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
 import org.apache.spark.sql.execution.SQLExecution.EXECUTION_ID_KEY
@@ -26,12 +27,14 @@ import org.apache.spark.sql.execution.command.MetadataCommand
 
 import org.apache.carbondata.common.logging.LogServiceFactory
 import org.apache.carbondata.core.constants.CarbonCommonConstants
+import org.apache.carbondata.core.datastore.compression.CompressorFactory
+import org.apache.carbondata.core.datastore.impl.FileFactory
 import org.apache.carbondata.core.exception.InvalidConfigurationException
 import org.apache.carbondata.core.metadata.AbsoluteTableIdentifier
 import org.apache.carbondata.core.metadata.encoder.Encoding
 import org.apache.carbondata.core.metadata.schema.partition.PartitionType
 import org.apache.carbondata.core.metadata.schema.table.{CarbonTable, TableInfo}
-import org.apache.carbondata.core.util.CarbonUtil
+import org.apache.carbondata.core.util.{CarbonProperties, CarbonUtil, ThreadLocalSessionInfo}
 import org.apache.carbondata.events.{CreateTablePostExecutionEvent, CreateTablePreExecutionEvent, OperationContext, OperationListenerBus}
 import org.apache.carbondata.spark.util.CarbonSparkUtil
 
@@ -48,7 +51,9 @@ case class CarbonCreateTableCommand(
     val LOGGER = LogServiceFactory.getLogService(this.getClass.getCanonicalName)
     val tableName = tableInfo.getFactTable.getTableName
     var databaseOpt : Option[String] = None
-    if(tableInfo.getDatabaseName != null) {
+    ThreadLocalSessionInfo
+      .setConfigurationToCurrentThread(sparkSession.sessionState.newHadoopConf())
+    if (tableInfo.getDatabaseName != null) {
       databaseOpt = Some(tableInfo.getDatabaseName)
     }
     val dbName = CarbonEnv.getDatabaseName(databaseOpt)(sparkSession)
@@ -56,7 +61,7 @@ case class CarbonCreateTableCommand(
     tableInfo.setDatabaseName(dbName)
     tableInfo.setTableUniqueName(CarbonTable.buildUniqueName(dbName, tableName))
     LOGGER.audit(s"Creating Table with Database name [$dbName] and Table name [$tableName]")
-
+    val isTransactionalTable = tableInfo.isTransactionalTable
     if (sparkSession.sessionState.catalog.listTables(dbName)
       .exists(_.table.equalsIgnoreCase(tableName))) {
       if (!ifNotExistsSet) {
@@ -66,10 +71,22 @@ case class CarbonCreateTableCommand(
         throw new TableAlreadyExistsException(dbName, tableName)
       }
     } else {
-      val tablePath = tableLocation.getOrElse(
+      val path = tableLocation.getOrElse(
         CarbonEnv.getTablePath(Some(dbName), tableName)(sparkSession))
+      val tablePath = if (FileFactory.getCarbonFile(path).exists() && !isExternal &&
+                          isTransactionalTable && tableLocation.isEmpty) {
+        path + "_" + tableInfo.getFactTable.getTableId
+      } else {
+        path
+      }
+      val streaming = tableInfo.getFactTable.getTableProperties.get("streaming")
+      if (path.startsWith("s3") && streaming != null && streaming != null &&
+          streaming.equalsIgnoreCase("true")) {
+        throw new UnsupportedOperationException("streaming is not supported with s3 store")
+      }
       tableInfo.setTablePath(tablePath)
-      val tableIdentifier = AbsoluteTableIdentifier.from(tablePath, dbName, tableName)
+      val tableIdentifier = AbsoluteTableIdentifier
+        .from(tablePath, dbName, tableName, tableInfo.getFactTable.getTableId)
 
       // Add validation for sort scope when create table
       val sortScope = tableInfo.getFactTable.getTableProperties.asScala
@@ -84,13 +101,24 @@ case class CarbonCreateTableCommand(
         throwMetadataException(dbName, tableName, "Table should have at least one column.")
       }
 
+      // Add validatation for column compressor when create table
+      val columnCompressor = tableInfo.getFactTable.getTableProperties.get(
+        CarbonCommonConstants.COMPRESSOR)
+      try {
+        if (null != columnCompressor) {
+          CompressorFactory.getInstance().getCompressor(columnCompressor)
+        }
+      } catch {
+        case ex : UnsupportedOperationException =>
+          throw new InvalidConfigurationException(ex.getMessage)
+      }
+
       val operationContext = new OperationContext
       val createTablePreExecutionEvent: CreateTablePreExecutionEvent =
         CreateTablePreExecutionEvent(sparkSession, tableIdentifier, Some(tableInfo))
       OperationListenerBus.getInstance.fireEvent(createTablePreExecutionEvent, operationContext)
       val catalog = CarbonEnv.getInstance(sparkSession).carbonMetastore
       val carbonSchemaString = catalog.generateTableSchemaString(tableInfo, tableIdentifier)
-      val isTransactionalTable = tableInfo.isTransactionalTable
       if (createDSTable) {
         try {
           val tablePath = tableIdentifier.getTablePath

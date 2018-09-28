@@ -23,6 +23,7 @@ import java.util.Map;
 
 import org.apache.carbondata.common.CarbonIterator;
 import org.apache.carbondata.core.cache.dictionary.Dictionary;
+import org.apache.carbondata.core.datamap.DataMapStoreManager;
 import org.apache.carbondata.core.datastore.block.TableBlockInfo;
 import org.apache.carbondata.core.scan.executor.QueryExecutor;
 import org.apache.carbondata.core.scan.executor.QueryExecutorFactory;
@@ -32,6 +33,7 @@ import org.apache.carbondata.core.scan.result.iterator.ChunkRowIterator;
 import org.apache.carbondata.core.util.CarbonUtil;
 import org.apache.carbondata.hadoop.readsupport.CarbonReadSupport;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.mapreduce.InputSplit;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 
@@ -49,16 +51,23 @@ public class CarbonRecordReader<T> extends AbstractRecordReader<T> {
   protected QueryExecutor queryExecutor;
   private InputMetricsStats inputMetricsStats;
 
+  /**
+   * Whether to clear datamap when reader is closed. In some scenarios such as datamap rebuild,
+   * we will set it to true and will clear the datamap after rebuild
+   */
+  private boolean skipClearDataMapAtClose = false;
+
   public CarbonRecordReader(QueryModel queryModel, CarbonReadSupport<T> readSupport,
-      InputMetricsStats inputMetricsStats) {
-    this(queryModel, readSupport);
+      InputMetricsStats inputMetricsStats, Configuration configuration) {
+    this(queryModel, readSupport, configuration);
     this.inputMetricsStats = inputMetricsStats;
   }
 
-  public CarbonRecordReader(QueryModel queryModel, CarbonReadSupport<T> readSupport) {
+  public CarbonRecordReader(QueryModel queryModel, CarbonReadSupport<T> readSupport,
+      Configuration configuration) {
     this.queryModel = queryModel;
     this.readSupport = readSupport;
-    this.queryExecutor = QueryExecutorFactory.getQueryExecutor(queryModel);
+    this.queryExecutor = QueryExecutorFactory.getQueryExecutor(queryModel, configuration);
   }
 
   @Override
@@ -77,8 +86,12 @@ public class CarbonRecordReader<T> extends AbstractRecordReader<T> {
     } else {
       throw new RuntimeException("unsupported input split type: " + inputSplit);
     }
-    List<TableBlockInfo> tableBlockInfoList = CarbonInputSplit.createBlocks(splitList);
-    queryModel.setTableBlockInfos(tableBlockInfoList);
+    // It should use the exists tableBlockInfos if tableBlockInfos of queryModel is not empty
+    // otherwise the prune is no use before this method
+    if (!queryModel.isFG()) {
+      List<TableBlockInfo> tableBlockInfoList = CarbonInputSplit.createBlocks(splitList);
+      queryModel.setTableBlockInfos(tableBlockInfoList);
+    }
     readSupport.initialize(queryModel.getProjectionColumns(), queryModel.getTable());
     try {
       carbonIterator = new ChunkRowIterator(queryExecutor.execute(queryModel));
@@ -89,7 +102,6 @@ public class CarbonRecordReader<T> extends AbstractRecordReader<T> {
 
   @Override public boolean nextKeyValue() {
     return carbonIterator.hasNext();
-
   }
 
   @Override public Void getCurrentKey() throws IOException, InterruptedException {
@@ -118,6 +130,11 @@ public class CarbonRecordReader<T> extends AbstractRecordReader<T> {
         CarbonUtil.clearDictionaryCache(entry.getValue());
       }
     }
+    if (!skipClearDataMapAtClose) {
+      // Clear the datamap cache
+      DataMapStoreManager.getInstance().clearDataMaps(
+          queryModel.getTable().getAbsoluteTableIdentifier());
+    }
     // close read support
     readSupport.close();
     try {
@@ -125,5 +142,9 @@ public class CarbonRecordReader<T> extends AbstractRecordReader<T> {
     } catch (QueryExecutionException e) {
       throw new IOException(e);
     }
+  }
+
+  public void setSkipClearDataMapAtClose(boolean skipClearDataMapAtClose) {
+    this.skipClearDataMapAtClose = skipClearDataMapAtClose;
   }
 }

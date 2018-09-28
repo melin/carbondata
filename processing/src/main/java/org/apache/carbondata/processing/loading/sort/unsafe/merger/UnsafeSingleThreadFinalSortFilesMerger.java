@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.PriorityQueue;
 
 import org.apache.carbondata.common.CarbonIterator;
@@ -142,7 +143,7 @@ public class UnsafeSingleThreadFinalSortFilesMerger extends CarbonIterator<Objec
       for (final File file : filesToMergeSort) {
 
         SortTempChunkHolder sortTempFileChunkHolder =
-            new UnsafeSortTempFileChunkHolder(file, parameters);
+            new UnsafeSortTempFileChunkHolder(file, parameters, true);
 
         // initialize
         sortTempFileChunkHolder.readRow();
@@ -195,8 +196,11 @@ public class UnsafeSingleThreadFinalSortFilesMerger extends CarbonIterator<Objec
    * @return sorted row
    */
   public Object[] next() {
-    IntermediateSortTempRow sortTempRow =  getSortedRecordFromFile();
-    return sortStepRowHandler.convertIntermediateSortTempRowTo3Parted(sortTempRow);
+    if (hasNext()) {
+      return sortStepRowHandler.convertIntermediateSortTempRowTo3Parted(getSortedRecordFromFile());
+    } else {
+      throw new NoSuchElementException("No more elements to return");
+    }
   }
 
   /**

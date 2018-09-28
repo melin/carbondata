@@ -25,10 +25,14 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
+import org.apache.carbondata.core.mutate.UpdateVO;
 import org.apache.carbondata.core.readcommitter.ReadCommittedScope;
 import org.apache.carbondata.core.statusmanager.LoadMetadataDetails;
+import org.apache.carbondata.core.statusmanager.SegmentRefreshInfo;
 import org.apache.carbondata.core.statusmanager.SegmentStatusManager;
 import org.apache.carbondata.core.util.path.CarbonTablePath;
+
+import org.apache.hadoop.conf.Configuration;
 
 /**
  * Represents one load of carbondata
@@ -57,6 +61,15 @@ public class Segment implements Serializable {
    * keeps all the details about segments
    */
   private LoadMetadataDetails loadMetadataDetails;
+
+  public Segment(String segmentNo) {
+    this.segmentNo = segmentNo;
+  }
+
+  public Segment(String segmentNo, ReadCommittedScope readCommittedScope) {
+    this.segmentNo = segmentNo;
+    this.readCommittedScope = readCommittedScope;
+  }
 
   /**
    * ReadCommittedScope will be null. So getCommittedIndexFile will not work and will throw
@@ -107,12 +120,21 @@ public class Segment implements Serializable {
     return readCommittedScope.getCommittedIndexFile(this);
   }
 
+  public SegmentRefreshInfo getSegmentRefreshInfo(UpdateVO updateVo)
+      throws IOException {
+    return readCommittedScope.getCommittedSegmentRefreshInfo(this, updateVo);
+  }
+
   public String getSegmentNo() {
     return segmentNo;
   }
 
   public String getSegmentFileName() {
     return segmentFileName;
+  }
+
+  public void setReadCommittedScope(ReadCommittedScope readCommittedScope) {
+    this.readCommittedScope = readCommittedScope;
   }
 
   public static List<Segment> toSegmentList(String[] segmentIds,
@@ -151,6 +173,16 @@ public class Segment implements Serializable {
   }
 
   /**
+   * Converts to segment object
+   * @param segmentId
+   * @return
+   */
+  public static Segment toSegment(String segmentId) {
+    // SegmentId can be combination of segmentNo and segmentFileName.
+    return toSegment(segmentId, null);
+  }
+
+  /**
    * Read the table status and get the segment corresponding to segmentNo
    * @param segmentNo
    * @param tablePath
@@ -159,12 +191,26 @@ public class Segment implements Serializable {
   public static Segment getSegment(String segmentNo, String tablePath) {
     LoadMetadataDetails[] loadMetadataDetails =
         SegmentStatusManager.readLoadMetadata(CarbonTablePath.getMetadataPath(tablePath));
+    return getSegment(segmentNo, loadMetadataDetails);
+  }
+
+  /**
+   * Get the segment object corresponding to segmentNo
+   * @param segmentNo
+   * @param loadMetadataDetails
+   * @return
+   */
+  public static Segment getSegment(String segmentNo, LoadMetadataDetails[] loadMetadataDetails) {
     for (LoadMetadataDetails details: loadMetadataDetails) {
       if (details.getLoadName().equals(segmentNo)) {
         return new Segment(details.getLoadName(), details.getSegmentFile());
       }
     }
     return null;
+  }
+
+  public Configuration getConfiguration() {
+    return readCommittedScope.getConfiguration();
   }
 
   public Set<String> getFilteredIndexShardNames() {
